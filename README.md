@@ -1,6 +1,3 @@
-
-claude --resume 52929940-c76c-4c74-9036-15b23906df3a
-
 # Reverse SOCKS5 Proxy over SSL Tunnel — Implementation Summary
 
 ## What This Is
