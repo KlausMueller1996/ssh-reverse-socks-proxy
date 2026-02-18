@@ -1,0 +1,10 @@
+bin/
+obj/
+.vs/
+vcpkg_installed/
+SPEC.md
+
+# VS user-specific files (may contain debug credentials)
+*.vcxproj.user
+*.suo
+*.user.props

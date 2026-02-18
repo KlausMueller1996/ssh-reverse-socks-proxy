@@ -1,0 +1,24 @@
+{
+    "configurations": [
+        {
+            "name": "MSVC x64 Debug",
+            "includePath": [
+                "${workspaceFolder}/ssh-proxy-lib/public",
+                "${workspaceFolder}/ssh-proxy-lib/include",
+                "${workspaceFolder}/ssh-proxy/include",
+                "${workspaceFolder}/vcpkg_installed/x64-windows-static/x64-windows-static/include"
+            ],
+            "defines": [
+                "WIN32_LEAN_AND_MEAN",
+                "NOMINMAX",
+                "_DEBUG",
+                "_UNICODE",
+                "UNICODE"
+            ],
+            "cppStandard": "c++17",
+            "compilerPath": "cl.exe",
+            "intelliSenseMode": "windows-msvc-x64"
+        }
+    ],
+    "version": 4
+}

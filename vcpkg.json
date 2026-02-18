@@ -1,0 +1,8 @@
+{
+  "name": "ssh-proxy",
+  "version": "0.1.0",
+  "dependencies": [
+    "libssh2",
+    "gtest"
+  ]
+}
