@@ -8,3 +8,7 @@ SPEC.md
 *.vcxproj.user
 *.suo
 *.user.props
+
+# VS Code personal environment files
+.vscode/settings.json
+.vscode/c_cpp_properties.json

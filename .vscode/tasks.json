@@ -1,18 +1,10 @@
 {
     "version": "2.0.0",
-    "windows": {
-        "options": {
-            "shell": {
-                "executable": "cmd.exe",
-                "args": ["/d", "/c"]
-            }
-        }
-    },
     "tasks": [
         {
             "label": "Build Debug",
-            "type": "shell",
-            "command": "\"C:\\Program Files\\Microsoft Visual Studio\\2022\\Community\\MSBuild\\Current\\Bin\\MSBuild.exe\"",
+            "type": "process",
+            "command": "C:\\Program Files\\Microsoft Visual Studio\\18\\Community\\MSBuild\\Current\\Bin\\MSBuild.exe",
             "args": [
                 "ssh-proxy.sln",
                 "/p:Configuration=Debug",
@@ -33,8 +25,8 @@
         },
         {
             "label": "Build Release",
-            "type": "shell",
-            "command": "\"C:\\Program Files\\Microsoft Visual Studio\\2022\\Community\\MSBuild\\Current\\Bin\\MSBuild.exe\"",
+            "type": "process",
+            "command": "C:\\Program Files\\Microsoft Visual Studio\\18\\Community\\MSBuild\\Current\\Bin\\MSBuild.exe",
             "args": [
                 "ssh-proxy.sln",
                 "/p:Configuration=Release",
@@ -52,8 +44,8 @@
         },
         {
             "label": "Clean Debug",
-            "type": "shell",
-            "command": "\"C:\\Program Files\\Microsoft Visual Studio\\2022\\Community\\MSBuild\\Current\\Bin\\MSBuild.exe\"",
+            "type": "process",
+            "command": "C:\\Program Files\\Microsoft Visual Studio\\18\\Community\\MSBuild\\Current\\Bin\\MSBuild.exe",
             "args": [
                 "ssh-proxy.sln",
                 "/t:Clean",
@@ -71,8 +63,8 @@
         },
         {
             "label": "Clean Release",
-            "type": "shell",
-            "command": "\"C:\\Program Files\\Microsoft Visual Studio\\2022\\Community\\MSBuild\\Current\\Bin\\MSBuild.exe\"",
+            "type": "process",
+            "command": "C:\\Program Files\\Microsoft Visual Studio\\18\\Community\\MSBuild\\Current\\Bin\\MSBuild.exe",
             "args": [
                 "ssh-proxy.sln",
                 "/t:Clean",
@@ -90,8 +82,8 @@
         },
         {
             "label": "Rebuild Debug",
-            "type": "shell",
-            "command": "\"C:\\Program Files\\Microsoft Visual Studio\\2022\\Community\\MSBuild\\Current\\Bin\\MSBuild.exe\"",
+            "type": "process",
+            "command": "C:\\Program Files\\Microsoft Visual Studio\\18\\Community\\MSBuild\\Current\\Bin\\MSBuild.exe",
             "args": [
                 "ssh-proxy.sln",
                 "/t:Rebuild",
