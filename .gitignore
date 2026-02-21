@@ -1,5 +1,6 @@
 bin/
 obj/
+x64/
 .vs/
 vcpkg_installed/
 SPEC.md
