@@ -1,41 +1,57 @@
 #include "ssh_transport.h"
 #include "logger.h"
+#include <algorithm>
 #include <cstring>
 #include <stdexcept>
 
+// Thread-local flag: true only on the SSH I/O thread.
+// SshChannel uses this to decide whether to call libssh2 directly (I/O thread)
+// or to marshal the call through a queue (any other thread).
+static thread_local bool s_is_io_thread = false;
+
 // ── SshChannel ────────────────────────────────────────────────────────────────
+
+SshChannel::SshChannel(LIBSSH2_CHANNEL* ch, PostWriteFn post_write, PostIoFn post_io)
+    : m_channel(ch)
+    , m_post_write(std::move(post_write))
+    , m_post_io(std::move(post_io))
+{}
 
 ErrorCode SshChannel::Read(uint8_t* buf, size_t len, size_t& bytes_read) {
     bytes_read = 0;
-    if (!m_channel) return ErrorCode::ChannelClosed;
+    LIBSSH2_CHANNEL* ch = m_channel.load();
+    if (!ch) return ErrorCode::ChannelClosed;
 
-    for (;;) {
-        ssize_t n = libssh2_channel_read(m_channel,
-                                         reinterpret_cast<char*>(buf),
-                                         len);
-        if (n > 0) {
-            bytes_read = static_cast<size_t>(n);
-            return ErrorCode::Success;
-        }
-        if (n == 0 || libssh2_channel_eof(m_channel)) {
-            return ErrorCode::ChannelClosed;
-        }
-        if (n == LIBSSH2_ERROR_EAGAIN) {
-            // Caller should select/poll; for now yield and retry
-            Sleep(1);
-            continue;
-        }
-        Logger::Error("libssh2_channel_read failed: %d", static_cast<int>(n));
-        return ErrorCode::ProtocolError;
+    ssize_t n = libssh2_channel_read(ch, reinterpret_cast<char*>(buf), len);
+    if (n > 0) {
+        bytes_read = static_cast<size_t>(n);
+        return ErrorCode::Success;
     }
+    if (n == 0 || libssh2_channel_eof(ch)) {
+        return ErrorCode::ChannelClosed;
+    }
+    if (n == LIBSSH2_ERROR_EAGAIN) {
+        return ErrorCode::WouldBlock;
+    }
+    Logger::Error("libssh2_channel_read failed: %d", static_cast<int>(n));
+    return ErrorCode::ProtocolError;
 }
 
 ErrorCode SshChannel::Write(const uint8_t* buf, size_t len) {
-    if (!m_channel) return ErrorCode::ChannelClosed;
+    LIBSSH2_CHANNEL* ch = m_channel.load();
+    if (!ch) return ErrorCode::ChannelClosed;
 
+    // If we're NOT on the SSH I/O thread, post via the write queue so libssh2
+    // is only touched by the I/O thread.
+    if (m_post_write && !s_is_io_thread) {
+        m_post_write(std::vector<uint8_t>(buf, buf + len));
+        return ErrorCode::Success;
+    }
+
+    // On the I/O thread: call libssh2 directly (blocking with EAGAIN retry).
     size_t written = 0;
     while (written < len) {
-        ssize_t n = libssh2_channel_write(m_channel,
+        ssize_t n = libssh2_channel_write(ch,
                                           reinterpret_cast<const char*>(buf + written),
                                           len - written);
         if (n > 0) {
@@ -53,19 +69,34 @@ ErrorCode SshChannel::Write(const uint8_t* buf, size_t len) {
 }
 
 void SshChannel::SendEof() {
-    if (m_channel) libssh2_channel_send_eof(m_channel);
+    LIBSSH2_CHANNEL* ch = m_channel.load();
+    if (!ch) return;
+
+    if (m_post_io && !s_is_io_thread) {
+        m_post_io([ch]() { libssh2_channel_send_eof(ch); });
+    } else {
+        libssh2_channel_send_eof(ch);
+    }
 }
 
 void SshChannel::Close() {
-    if (m_channel) {
-        libssh2_channel_close(m_channel);
-        libssh2_channel_free(m_channel);
-        m_channel = nullptr;
+    LIBSSH2_CHANNEL* ch = m_channel.exchange(nullptr);
+    if (!ch) return;
+
+    if (m_post_io && !s_is_io_thread) {
+        m_post_io([ch]() {
+            libssh2_channel_close(ch);
+            libssh2_channel_free(ch);
+        });
+    } else {
+        libssh2_channel_close(ch);
+        libssh2_channel_free(ch);
     }
 }
 
 bool SshChannel::IsEof() const {
-    return m_channel ? libssh2_channel_eof(m_channel) != 0 : true;
+    LIBSSH2_CHANNEL* ch = m_channel.load();
+    return ch ? libssh2_channel_eof(ch) != 0 : true;
 }
 
 // ── SshTransport ──────────────────────────────────────────────────────────────
@@ -211,11 +242,15 @@ void SshTransport::StartAccepting(OnChannelAccepted on_channel,
 
 void SshTransport::IoThreadProc(OnChannelAccepted on_channel,
                                  OnDisconnected on_disconnect) {
+    s_is_io_thread = true;
     Logger::Debug("SSH I/O thread started");
 
     ErrorCode disconnect_reason = ErrorCode::Success;
 
     while (!m_cancel.load()) {
+        // ── Drain callbacks posted from IOCP threads ──────────────────────────
+        DrainIoCallbacks();
+
         // ── Send keepalives ───────────────────────────────────────────────────
         int next_keepalive = 0;
         libssh2_keepalive_send(m_session, &next_keepalive);
@@ -223,11 +258,25 @@ void SshTransport::IoThreadProc(OnChannelAccepted on_channel,
         // ── Drain per-channel write queues ────────────────────────────────────
         DrainWriteQueues();
 
+        // ── Pump active SOCKS5 sessions (SSH channel → TCP) ───────────────────
+        PumpSessions();
+
         // ── Accept new channels ───────────────────────────────────────────────
         LIBSSH2_CHANNEL* ch = libssh2_channel_forward_accept(m_listener);
         if (ch) {
             Logger::Debug("Accepted forwarded-tcpip channel");
-            auto ssh_ch = std::make_unique<SshChannel>(ch);
+
+            // Inject thread-safety callbacks so IOCP threads never call
+            // libssh2 directly through SshChannel::Write/SendEof/Close.
+            auto post_write = [this, ch](std::vector<uint8_t> data) {
+                PostChannelWrite(ch, std::move(data));
+            };
+            auto post_io = [this](std::function<void()> fn) {
+                PostToIoThread(std::move(fn));
+            };
+
+            auto ssh_ch = std::make_unique<SshChannel>(
+                ch, std::move(post_write), std::move(post_io));
             on_channel(std::move(ssh_ch));
             continue;
         }
@@ -279,6 +328,22 @@ void SshTransport::DrainWriteQueues() {
     }
 }
 
+void SshTransport::DrainIoCallbacks() {
+    std::vector<std::function<void()>> callbacks;
+    {
+        std::lock_guard<std::mutex> lock(m_io_callbacks_mutex);
+        callbacks.swap(m_io_callbacks);
+    }
+    for (auto& fn : callbacks) fn();
+}
+
+void SshTransport::PumpSessions() {
+    m_session_pumps.erase(
+        std::remove_if(m_session_pumps.begin(), m_session_pumps.end(),
+            [](auto& fn) { return !fn(); }),
+        m_session_pumps.end());
+}
+
 void SshTransport::PostChannelWrite(LIBSSH2_CHANNEL* ch, std::vector<uint8_t> data) {
     std::lock_guard<std::mutex> lock(m_queues_mutex);
     for (auto& q : m_write_queues) {
@@ -292,6 +357,16 @@ void SshTransport::PostChannelWrite(LIBSSH2_CHANNEL* ch, std::vector<uint8_t> da
     q.channel = ch;
     q.pending.push_back(std::move(data));
     m_write_queues.push_back(std::move(q));
+}
+
+void SshTransport::RegisterSessionPump(SessionPumpFn fn) {
+    // Called on the SSH I/O thread (from within on_channel) — no mutex needed.
+    m_session_pumps.push_back(std::move(fn));
+}
+
+void SshTransport::PostToIoThread(std::function<void()> fn) {
+    std::lock_guard<std::mutex> lock(m_io_callbacks_mutex);
+    m_io_callbacks.push_back(std::move(fn));
 }
 
 void SshTransport::Close() {

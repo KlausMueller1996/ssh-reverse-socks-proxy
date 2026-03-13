@@ -50,6 +50,7 @@ enum class ErrorCode : int {
     Socks5UnsupportedAddressType,
     Shutdown,
     IoIncomplete,
+    WouldBlock,
 };
 
 inline const char* ErrorCodeToString(ErrorCode ec) {
@@ -75,6 +76,7 @@ inline const char* ErrorCodeToString(ErrorCode ec) {
     case ErrorCode::Socks5UnsupportedAddressType: return "Socks5UnsupportedAddressType";
     case ErrorCode::Shutdown:                     return "Shutdown";
     case ErrorCode::IoIncomplete:                 return "IoIncomplete";
+    case ErrorCode::WouldBlock:                   return "WouldBlock";
     }
     return "Unknown";
 }

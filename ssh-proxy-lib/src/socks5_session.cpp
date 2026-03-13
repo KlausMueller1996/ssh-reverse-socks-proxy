@@ -14,11 +14,17 @@ void Socks5Session::Start() {
 }
 
 void Socks5Session::ReadFromChannel() {
-    if (m_state == State::Closed) return;
+    if (m_state.load() == State::Closed) return;
 
     uint8_t buf[4096];
     size_t bytes_read = 0;
-    ErrorCode ec = m_channel->Read(buf, sizeof(buf), bytes_read);
+    ErrorCode ec;
+
+    // Loop on WouldBlock: on the SSH I/O thread, spin-wait until data arrives.
+    do {
+        ec = m_channel->Read(buf, sizeof(buf), bytes_read);
+        if (ec == ErrorCode::WouldBlock) Sleep(1);
+    } while (ec == ErrorCode::WouldBlock);
 
     if (ec != ErrorCode::Success || bytes_read == 0) {
         Close();
@@ -31,7 +37,7 @@ void Socks5Session::ReadFromChannel() {
 void Socks5Session::OnChannelData(const uint8_t* data, size_t len) {
     m_inbound_buf.insert(m_inbound_buf.end(), data, data + len);
 
-    switch (m_state) {
+    switch (m_state.load()) {
     case State::ReadingMethods:
         HandleMethodNegotiation(m_inbound_buf.data(), m_inbound_buf.size());
         break;
@@ -63,7 +69,7 @@ void Socks5Session::HandleMethodNegotiation(const uint8_t* data, size_t len) {
     auto reply = Socks5::BuildMethodResponse(Socks5::AUTH_NONE);
     m_channel->Write(reply.data(), reply.size());
 
-    m_state = State::ReadingRequest;
+    m_state.store(State::ReadingRequest);
     ReadFromChannel();
 }
 
@@ -99,7 +105,7 @@ void Socks5Session::HandleConnectRequest(const uint8_t* data, size_t len) {
 }
 
 void Socks5Session::StartTcpConnect(const Socks5::ConnectRequest& req) {
-    m_state = State::Connecting;
+    m_state.store(State::Connecting);
 
     auto self = shared_from_this();
     ErrorCode ec = m_tcp.ConnectAsync(req.host, req.port,
@@ -115,6 +121,9 @@ void Socks5Session::StartTcpConnect(const Socks5::ConnectRequest& req) {
 }
 
 void Socks5Session::OnTcpConnected(ErrorCode ec) {
+    // This fires on an IOCP worker thread. All m_channel calls go through
+    // the post_write / post_io queues and are safe to call here.
+
     if (ec != ErrorCode::Success) {
         Logger::Warn("SOCKS5: target TCP connect failed: %s", ErrorCodeToString(ec));
         auto reply = Socks5::BuildConnectReply(Socks5::ErrorCodeToSocks5Reply(ec));
@@ -123,44 +132,61 @@ void Socks5Session::OnTcpConnected(ErrorCode ec) {
         return;
     }
 
-    // Send success reply
+    // Send SOCKS5 success reply (enqueued → SSH I/O thread drains it).
     auto reply = Socks5::BuildConnectReply(Socks5::REP_SUCCESS);
     m_channel->Write(reply.data(), reply.size());
 
-    m_state = State::Relaying;
+    m_state.store(State::Relaying);
     StartRelay();
 }
 
 void Socks5Session::StartRelay() {
+    // Called from an IOCP thread. Set up the TCP→SSH direction only.
+    // The SSH→TCP direction is handled by PumpSshRead(), which is called by
+    // the SSH I/O thread on every loop iteration.
+
     auto self = shared_from_this();
 
-    // Target → SSH channel (IOCP thread → channel write queue)
     m_tcp.StartReading(
         [self](const uint8_t* data, size_t len) {
-            // Data from target: write to SSH channel
+            // IOCP thread → write enqueued via post_write, never calls libssh2 directly.
             self->m_channel->Write(data, len);
         },
         [self](ErrorCode) {
+            // IOCP thread → SendEof/Close enqueued via post_io.
             self->m_channel->SendEof();
             self->Close();
         });
+}
 
-    // SSH channel → target (run on calling/I/O thread, loop until EOF)
-    for (;;) {
-        if (m_channel->IsEof()) break;
-        uint8_t buf[4096];
-        size_t bytes_read = 0;
-        ErrorCode ec = m_channel->Read(buf, sizeof(buf), bytes_read);
-        if (ec != ErrorCode::Success || bytes_read == 0) break;
-        m_tcp.Send(buf, bytes_read);
+bool Socks5Session::PumpSshRead() {
+    // Called on the SSH I/O thread every loop iteration.
+
+    State s = m_state.load();
+    if (s == State::Closed) return false;
+    if (s != State::Relaying) return true;  // still in handshake; keep pump alive
+
+    uint8_t buf[4096];
+    size_t bytes_read = 0;
+    ErrorCode ec = m_channel->Read(buf, sizeof(buf), bytes_read);
+
+    if (ec == ErrorCode::WouldBlock) return true;  // no data yet, try next iteration
+
+    if (ec != ErrorCode::Success || bytes_read == 0) {
+        Close();
+        return false;
     }
 
-    Close();
+    m_tcp.Send(buf, bytes_read);
+    return true;
 }
 
 void Socks5Session::Close() {
-    if (m_state == State::Closed) return;
-    m_state = State::Closed;
+    // Atomic exchange ensures Close runs exactly once even if called from both
+    // the IOCP thread (TCP close callback) and the SSH I/O thread (PumpSshRead).
+    State prev = m_state.exchange(State::Closed);
+    if (prev == State::Closed) return;
+
     m_tcp.Close();
     if (m_channel) {
         m_channel->SendEof();

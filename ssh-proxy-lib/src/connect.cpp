@@ -82,9 +82,20 @@ Connect::Connect(
 
     // Start the channel-accept loop on the internal I/O thread
     m_impl->transport.StartAccepting(
-        // on_channel: fired for each forwarded-tcpip channel
-        [](std::unique_ptr<SshChannel> ch) {
+        // on_channel: fired on the SSH I/O thread for each forwarded-tcpip channel.
+        [impl = m_impl](std::unique_ptr<SshChannel> ch) {
             auto session = std::make_shared<Socks5Session>(std::move(ch));
+
+            // Register the SSH→TCP pump so the I/O thread drives it each
+            // loop iteration instead of blocking an IOCP worker thread.
+            impl->transport.RegisterSessionPump([session]() -> bool {
+                return session->PumpSshRead();
+            });
+
+            // Run the SOCKS5 handshake synchronously on the I/O thread.
+            // Start() is non-blocking after this change: it reads the method
+            // request and CONNECT request, then fires an async TCP connect and
+            // returns. The relay is driven by the pump above.
             session->Start();
         },
         // on_disconnect: fired when the session drops unexpectedly

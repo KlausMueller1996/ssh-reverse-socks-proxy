@@ -3,6 +3,7 @@
 #include "ssh_channel.h"
 #include "tcp_connection.h"
 #include "socks5_handler.h"
+#include <atomic>
 #include <memory>
 #include <vector>
 
@@ -22,6 +23,12 @@ public:
     // Begin the SOCKS5 handshake. Must be called on the SSH I/O thread.
     // The session manages its own lifetime via shared_ptr once started.
     void Start();
+
+    // Called by the SSH I/O thread on every loop iteration once the session is
+    // registered as a pump. Reads pending data from the SSH channel and forwards
+    // it to the target TCP connection. Returns false when the session is done
+    // (caller should deregister the pump).
+    bool PumpSshRead();
 
 private:
     enum class State {
@@ -43,8 +50,8 @@ private:
     void StartRelay();
     void Close();
 
-    std::unique_ptr<IChannel> m_channel;
-    TcpConnection             m_tcp;
-    State                     m_state = State::ReadingMethods;
-    std::vector<uint8_t>      m_inbound_buf;   // data from SSH channel
+    std::unique_ptr<IChannel>  m_channel;
+    TcpConnection              m_tcp;
+    std::atomic<State>         m_state{State::ReadingMethods};
+    std::vector<uint8_t>       m_inbound_buf;   // data from SSH channel
 };

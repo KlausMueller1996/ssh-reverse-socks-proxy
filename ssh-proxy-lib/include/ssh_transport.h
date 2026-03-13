@@ -20,6 +20,9 @@ public:
     using OnChannelAccepted = std::function<void(std::unique_ptr<SshChannel>)>;
     // Fires on the SSH I/O thread when the session drops.
     using OnDisconnected    = std::function<void(ErrorCode)>;
+    // Called on every I/O thread loop iteration. Returns false when done
+    // (automatically removed from the pump list).
+    using SessionPumpFn     = std::function<bool()>;
 
     SshTransport();
     ~SshTransport();
@@ -50,9 +53,19 @@ public:
     // The I/O thread drains all queues in its select loop.
     void PostChannelWrite(LIBSSH2_CHANNEL* ch, std::vector<uint8_t> data);
 
+    // Register a pump to be called on every I/O thread loop iteration.
+    // MUST be called on the SSH I/O thread (e.g. from within on_channel callback).
+    void RegisterSessionPump(SessionPumpFn fn);
+
+    // Post a callback to run on the SSH I/O thread. Thread-safe.
+    // Used by SshChannel to marshal SendEof/Close from IOCP threads.
+    void PostToIoThread(std::function<void()> fn);
+
 private:
     void IoThreadProc(OnChannelAccepted on_channel, OnDisconnected on_disconnect);
     void DrainWriteQueues();
+    void DrainIoCallbacks();
+    void PumpSessions();
 
     SOCKET            m_socket  = INVALID_SOCKET;
     LIBSSH2_SESSION*  m_session = nullptr;
@@ -69,4 +82,11 @@ private:
     };
     std::mutex                   m_queues_mutex;
     std::vector<ChannelQueue>    m_write_queues;
+
+    // Session pumps: driven by I/O thread each loop iteration (I/O thread only).
+    std::vector<SessionPumpFn>   m_session_pumps;
+
+    // Callbacks posted from IOCP threads to run on the I/O thread.
+    std::mutex                           m_io_callbacks_mutex;
+    std::vector<std::function<void()>>   m_io_callbacks;
 };
