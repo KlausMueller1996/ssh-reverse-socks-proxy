@@ -3,6 +3,7 @@
 
 Socks5Session::Socks5Session(std::unique_ptr<IChannel> channel)
     : m_channel(std::move(channel))
+    , m_tcp(std::make_shared<TcpConnection>())
 {}
 
 Socks5Session::~Socks5Session() {
@@ -107,17 +108,14 @@ void Socks5Session::HandleConnectRequest(const uint8_t* data, size_t len) {
 void Socks5Session::StartTcpConnect(const Socks5::ConnectRequest& req) {
     m_state.store(State::Connecting);
 
-    auto self = shared_from_this();
-    ErrorCode ec = m_tcp.ConnectAsync(req.host, req.port,
-        [self](ErrorCode connect_ec) {
-            self->OnTcpConnected(connect_ec);
+    // Use weak_ptr: TcpConnection must not hold a strong ref back to the session
+    // (session owns m_tcp, so that would be a cycle).
+    std::weak_ptr<Socks5Session> weak = weak_from_this();
+    m_tcp->ConnectAsync(req.host, req.port,
+        [weak](ErrorCode connect_ec) {
+            if (auto self = weak.lock()) self->OnTcpConnected(connect_ec);
         });
-
-    if (ec != ErrorCode::Success) {
-        auto reply = Socks5::BuildConnectReply(Socks5::ErrorCodeToSocks5Reply(ec));
-        m_channel->Write(reply.data(), reply.size());
-        Close();
-    }
+    // Errors (DNS failure, socket error) now arrive via the callback above.
 }
 
 void Socks5Session::OnTcpConnected(ErrorCode ec) {
@@ -142,20 +140,21 @@ void Socks5Session::OnTcpConnected(ErrorCode ec) {
 
 void Socks5Session::StartRelay() {
     // Called from an IOCP thread. Set up the TCP→SSH direction only.
-    // The SSH→TCP direction is handled by PumpSshRead(), which is called by
-    // the SSH I/O thread on every loop iteration.
+    // The SSH→TCP direction is handled by PumpSshRead(), called by the SSH I/O thread.
 
-    auto self = shared_from_this();
+    // weak_ptr breaks the ownership cycle: session owns m_tcp (shared_ptr),
+    // so m_tcp's callbacks must not hold a strong ref back to the session.
+    std::weak_ptr<Socks5Session> weak = weak_from_this();
 
-    m_tcp.StartReading(
-        [self](const uint8_t* data, size_t len) {
-            // IOCP thread → write enqueued via post_write, never calls libssh2 directly.
-            self->m_channel->Write(data, len);
+    m_tcp->StartReading(
+        [weak](const uint8_t* data, size_t len) {
+            if (auto self = weak.lock()) self->m_channel->Write(data, len);
         },
-        [self](ErrorCode) {
-            // IOCP thread → SendEof/Close enqueued via post_io.
-            self->m_channel->SendEof();
-            self->Close();
+        [weak](ErrorCode) {
+            if (auto self = weak.lock()) {
+                self->m_channel->SendEof();
+                self->Close();
+            }
         });
 }
 
@@ -177,7 +176,7 @@ bool Socks5Session::PumpSshRead() {
         return false;
     }
 
-    m_tcp.Send(buf, bytes_read);
+    m_tcp->Send(buf, bytes_read);
     return true;
 }
 
@@ -187,7 +186,7 @@ void Socks5Session::Close() {
     State prev = m_state.exchange(State::Closed);
     if (prev == State::Closed) return;
 
-    m_tcp.Close();
+    m_tcp->Close();
     if (m_channel) {
         m_channel->SendEof();
         m_channel->Close();

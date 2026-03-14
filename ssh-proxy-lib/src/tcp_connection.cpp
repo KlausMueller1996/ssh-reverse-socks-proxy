@@ -16,12 +16,32 @@ TcpConnection::~TcpConnection() {
     DeleteCriticalSection(&m_send_cs);
 }
 
-ErrorCode TcpConnection::ConnectAsync(const std::string& host, uint16_t port, OnConnected on_connected) {
+ErrorCode TcpConnection::ConnectAsync(const std::string& host, uint16_t port,
+                                       OnConnected on_connected) {
     m_on_connected = std::move(on_connected);
 
-    // DNS resolve (blocking — called from channel context)
+    // Post DNS + socket setup as a work item on an IOCP worker thread so the
+    // SSH I/O thread is not blocked by getaddrinfo.
+    ZeroMemory(static_cast<OVERLAPPED*>(&m_dns_ctx), sizeof(OVERLAPPED));
+    m_dns_ctx.op = IoOp::Timer;  // repurposed as a generic work item
+    m_dns_ctx.callback = [self = shared_from_this(), host, port]
+                         (IoContext*, DWORD, ErrorCode) mutable {
+        self->DoConnectOnWorkerThread(std::move(host), port);
+    };
+    IoEngine::PostCompletion(&m_dns_ctx);
+    return ErrorCode::Success;
+}
+
+void TcpConnection::DoConnectOnWorkerThread(std::string host, uint16_t port) {
+    // Guard against Close() being called before this work item was processed.
+    if (m_abort.load()) {
+        if (m_on_connected) m_on_connected(ErrorCode::Shutdown);
+        return;
+    }
+
+    // DNS resolve (blocking, but on an IOCP worker thread — not the SSH I/O thread)
     struct addrinfo hints{}, *result = nullptr;
-    hints.ai_family = AF_INET;
+    hints.ai_family   = AF_INET;
     hints.ai_socktype = SOCK_STREAM;
     hints.ai_protocol = IPPROTO_TCP;
 
@@ -31,33 +51,39 @@ ErrorCode TcpConnection::ConnectAsync(const std::string& host, uint16_t port, On
     int ret = getaddrinfo(host.c_str(), port_str, &hints, &result);
     if (ret != 0 || !result) {
         Logger::Warn("DNS resolve failed for %s: %d", host.c_str(), ret);
-        return ErrorCode::DnsResolutionFailed;
+        if (m_on_connected) m_on_connected(ErrorCode::DnsResolutionFailed);
+        return;
     }
 
-    // Find first result and create socket
+    if (m_abort.load()) {
+        freeaddrinfo(result);
+        if (m_on_connected) m_on_connected(ErrorCode::Shutdown);
+        return;
+    }
+
     struct addrinfo* addr = result;
     m_socket = WSASocketW(addr->ai_family, SOCK_STREAM, IPPROTO_TCP,
                           nullptr, 0, WSA_FLAG_OVERLAPPED);
     if (m_socket == INVALID_SOCKET) {
         freeaddrinfo(result);
-        return ErrorCode::SocketError;
+        if (m_on_connected) m_on_connected(ErrorCode::SocketError);
+        return;
     }
 
     // ConnectEx requires the socket to be bound
-    struct sockaddr_storage bind_addr{};
-    int bind_len = 0;
-    struct sockaddr_in* sa = reinterpret_cast<struct sockaddr_in*>(&bind_addr);
-    sa->sin_family = AF_INET;
-    sa->sin_addr.s_addr = INADDR_ANY;
-    sa->sin_port = 0;
-    bind_len = sizeof(struct sockaddr_in);
+    struct sockaddr_in bind_addr{};
+    bind_addr.sin_family      = AF_INET;
+    bind_addr.sin_addr.s_addr = INADDR_ANY;
+    bind_addr.sin_port        = 0;
 
-    if (bind(m_socket, reinterpret_cast<struct sockaddr*>(&bind_addr), bind_len) != 0) {
+    if (bind(m_socket, reinterpret_cast<struct sockaddr*>(&bind_addr),
+             sizeof(bind_addr)) != 0) {
         Logger::Error("bind failed: %d", WSAGetLastError());
         closesocket(m_socket);
         m_socket = INVALID_SOCKET;
         freeaddrinfo(result);
-        return ErrorCode::SocketError;
+        if (m_on_connected) m_on_connected(ErrorCode::SocketError);
+        return;
     }
 
     // Associate with IOCP
@@ -66,32 +92,34 @@ ErrorCode TcpConnection::ConnectAsync(const std::string& host, uint16_t port, On
         closesocket(m_socket);
         m_socket = INVALID_SOCKET;
         freeaddrinfo(result);
-        return ec;
+        if (m_on_connected) m_on_connected(ec);
+        return;
     }
 
     // Disable Nagle
     BOOL nodelay = TRUE;
-    setsockopt(m_socket, IPPROTO_TCP, TCP_NODELAY, reinterpret_cast<const char*>(&nodelay), sizeof(nodelay));
+    setsockopt(m_socket, IPPROTO_TCP, TCP_NODELAY,
+               reinterpret_cast<const char*>(&nodelay), sizeof(nodelay));
 
     // Initiate async connect
     ZeroMemory(static_cast<OVERLAPPED*>(&m_connect_ctx), sizeof(OVERLAPPED));
-    m_connect_ctx.op = IoOp::Connect;
+    m_connect_ctx.op     = IoOp::Connect;
     m_connect_ctx.socket = m_socket;
-    m_connect_ctx.callback = [this](IoContext* ctx, DWORD bytes, ErrorCode ec2) {
-        (void)bytes;
-        (void)ctx;
-
+    m_connect_ctx.callback = [self = shared_from_this()]
+                              (IoContext*, DWORD, ErrorCode ec2) {
         if (ec2 == ErrorCode::Success) {
-            // Update socket context so shutdown/getpeername work
-            setsockopt(m_socket, SOL_SOCKET, SO_UPDATE_CONNECT_CONTEXT, nullptr, 0);
-            m_connected = true;
-            Logger::Debug("Target connected (socket %llu)", static_cast<unsigned long long>(m_socket));
+            setsockopt(self->m_socket, SOL_SOCKET, SO_UPDATE_CONNECT_CONTEXT,
+                       nullptr, 0);
+            self->m_connected = true;
+            Logger::Debug("Target connected (socket %llu)",
+                          static_cast<unsigned long long>(self->m_socket));
         }
-        if (m_on_connected) m_on_connected(ec2);
+        if (self->m_on_connected) self->m_on_connected(ec2);
     };
 
     LPFN_CONNECTEX connect_ex = IoEngine::GetConnectEx();
-    BOOL ok = connect_ex(m_socket, addr->ai_addr, static_cast<int>(addr->ai_addrlen),
+    BOOL ok = connect_ex(m_socket, addr->ai_addr,
+                         static_cast<int>(addr->ai_addrlen),
                          nullptr, 0, nullptr, &m_connect_ctx);
     freeaddrinfo(result);
 
@@ -99,17 +127,16 @@ ErrorCode TcpConnection::ConnectAsync(const std::string& host, uint16_t port, On
         int err = WSAGetLastError();
         if (err != ERROR_IO_PENDING) {
             Logger::Error("ConnectEx failed: %d", err);
+            m_connect_ctx.callback = nullptr;  // release shared_ptr
             closesocket(m_socket);
             m_socket = INVALID_SOCKET;
-            return WsaToErrorCode(err);
+            if (m_on_connected) m_on_connected(WsaToErrorCode(err));
         }
     }
-
-    return ErrorCode::Success;
 }
 
 void TcpConnection::StartReading(OnDataReceived on_data, OnDisconnected on_disconnect) {
-    m_on_data = std::move(on_data);
+    m_on_data       = std::move(on_data);
     m_on_disconnect = std::move(on_disconnect);
     m_reading = true;
     PostRecv();
@@ -119,16 +146,18 @@ void TcpConnection::PostRecv() {
     if (!m_connected || !m_reading) return;
 
     ZeroMemory(static_cast<OVERLAPPED*>(&m_recv_ctx), sizeof(OVERLAPPED));
-    m_recv_ctx.op = IoOp::Recv;
-    m_recv_ctx.socket = m_socket;
-    m_recv_ctx.wsa_buf.buf = reinterpret_cast<char*>(m_recv_ctx.inline_buf);
-    m_recv_ctx.wsa_buf.len = sizeof(m_recv_ctx.inline_buf);
-    m_recv_ctx.callback = [this](IoContext* ctx, DWORD bytes, ErrorCode ec) {
-        OnRecvComplete(ctx, bytes, ec);
+    m_recv_ctx.op            = IoOp::Recv;
+    m_recv_ctx.socket        = m_socket;
+    m_recv_ctx.wsa_buf.buf   = reinterpret_cast<char*>(m_recv_ctx.inline_buf);
+    m_recv_ctx.wsa_buf.len   = sizeof(m_recv_ctx.inline_buf);
+    m_recv_ctx.callback = [self = shared_from_this()](IoContext* ctx, DWORD bytes,
+                                                       ErrorCode ec) {
+        self->OnRecvComplete(ctx, bytes, ec);
     };
 
     DWORD flags = 0;
-    int ret = WSARecv(m_socket, &m_recv_ctx.wsa_buf, 1, nullptr, &flags, &m_recv_ctx, nullptr);
+    int ret = WSARecv(m_socket, &m_recv_ctx.wsa_buf, 1, nullptr, &flags,
+                      &m_recv_ctx, nullptr);
     if (ret == SOCKET_ERROR) {
         int err = WSAGetLastError();
         if (err != WSA_IO_PENDING) {
@@ -142,7 +171,8 @@ void TcpConnection::PostRecv() {
 void TcpConnection::OnRecvComplete(IoContext* /*ctx*/, DWORD bytes, ErrorCode ec) {
     if (ec != ErrorCode::Success || bytes == 0) {
         m_reading = false;
-        if (m_on_disconnect) m_on_disconnect(ec == ErrorCode::Success ? ErrorCode::ConnectionReset : ec);
+        if (m_on_disconnect)
+            m_on_disconnect(ec == ErrorCode::Success ? ErrorCode::ConnectionReset : ec);
         return;
     }
 
@@ -181,15 +211,17 @@ void TcpConnection::FlushSendQueue() {
     ByteBuffer& front = m_send_queue.front();
 
     ZeroMemory(static_cast<OVERLAPPED*>(&m_send_ctx), sizeof(OVERLAPPED));
-    m_send_ctx.op = IoOp::Send;
-    m_send_ctx.socket = m_socket;
-    m_send_ctx.wsa_buf.buf = reinterpret_cast<char*>(front.data());
-    m_send_ctx.wsa_buf.len = static_cast<ULONG>(front.size());
-    m_send_ctx.callback = [this](IoContext* ctx, DWORD bytes, ErrorCode ec) {
-        OnSendComplete(ctx, bytes, ec);
+    m_send_ctx.op            = IoOp::Send;
+    m_send_ctx.socket        = m_socket;
+    m_send_ctx.wsa_buf.buf   = reinterpret_cast<char*>(front.data());
+    m_send_ctx.wsa_buf.len   = static_cast<ULONG>(front.size());
+    m_send_ctx.callback = [self = shared_from_this()](IoContext* ctx, DWORD bytes,
+                                                       ErrorCode ec) {
+        self->OnSendComplete(ctx, bytes, ec);
     };
 
-    int ret = WSASend(m_socket, &m_send_ctx.wsa_buf, 1, nullptr, 0, &m_send_ctx, nullptr);
+    int ret = WSASend(m_socket, &m_send_ctx.wsa_buf, 1, nullptr, 0,
+                      &m_send_ctx, nullptr);
     if (ret == SOCKET_ERROR) {
         int err = WSAGetLastError();
         if (err != WSA_IO_PENDING) {
@@ -217,11 +249,11 @@ void TcpConnection::OnSendComplete(IoContext* /*ctx*/, DWORD /*bytes*/, ErrorCod
 }
 
 void TcpConnection::Close() {
+    m_abort.store(true);
     m_connected = false;
-    m_reading = false;
+    m_reading   = false;
 
     if (m_socket != INVALID_SOCKET) {
-        // Cancel pending I/O
         CancelIoEx(reinterpret_cast<HANDLE>(m_socket), nullptr);
         shutdown(m_socket, SD_BOTH);
         closesocket(m_socket);

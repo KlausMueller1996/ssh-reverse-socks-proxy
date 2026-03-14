@@ -38,13 +38,18 @@ public:
 class SshChannel : public IChannel {
 public:
     // Posts write data to the SSH I/O thread's per-channel queue.
-    using PostWriteFn = std::function<void(std::vector<uint8_t>)>;
+    using PostWriteFn  = std::function<void(std::vector<uint8_t>)>;
     // Posts an arbitrary callback to run on the SSH I/O thread.
-    using PostIoFn    = std::function<void(std::function<void()>)>;
+    using PostIoFn     = std::function<void(std::function<void()>)>;
+    // Called synchronously at the start of Close(), before channel_free is posted.
+    // Used by SshTransport to remove the channel from the write queue while it is
+    // still valid, preventing DrainWriteQueues from writing to a freed channel.
+    using PreCloseFn   = std::function<void(LIBSSH2_CHANNEL*)>;
 
     explicit SshChannel(LIBSSH2_CHANNEL* ch,
                         PostWriteFn post_write = {},
-                        PostIoFn    post_io    = {});
+                        PostIoFn    post_io    = {},
+                        PreCloseFn  pre_close  = {});
     ~SshChannel() override { Close(); }
 
     SshChannel(const SshChannel&) = delete;
@@ -60,4 +65,5 @@ private:
     std::atomic<LIBSSH2_CHANNEL*> m_channel;
     PostWriteFn                   m_post_write;
     PostIoFn                      m_post_io;
+    PreCloseFn                    m_pre_close;
 };

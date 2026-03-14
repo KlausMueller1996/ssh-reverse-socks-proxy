@@ -50,8 +50,8 @@ private:
     void StartRelay();
     void Close();
 
-    std::unique_ptr<IChannel>  m_channel;
-    TcpConnection              m_tcp;
+    std::unique_ptr<IChannel>           m_channel;
+    std::shared_ptr<TcpConnection>      m_tcp;
     std::atomic<State>         m_state{State::ReadingMethods};
     std::vector<uint8_t>       m_inbound_buf;   // data from SSH channel
 };

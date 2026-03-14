@@ -151,7 +151,11 @@ DWORD WINAPI IoEngine::WorkerThread(LPVOID /*param*/) {
         }
 
         if (ctx->callback) {
-            ctx->callback(ctx, bytes_transferred, ec);
+            // Move out before calling: releases any shared_ptr captured in the
+            // callback immediately after the call, breaking self-reference cycles
+            // (e.g. IoContext callback → shared_ptr<TcpConnection> → IoContext).
+            auto cb = std::move(ctx->callback);
+            cb(ctx, bytes_transferred, ec);
         }
     }
 

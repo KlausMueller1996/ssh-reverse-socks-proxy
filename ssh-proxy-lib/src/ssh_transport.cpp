@@ -11,10 +11,11 @@ static thread_local bool s_is_io_thread = false;
 
 // ── SshChannel ────────────────────────────────────────────────────────────────
 
-SshChannel::SshChannel(LIBSSH2_CHANNEL* ch, PostWriteFn post_write, PostIoFn post_io)
+SshChannel::SshChannel(LIBSSH2_CHANNEL* ch, PostWriteFn post_write, PostIoFn post_io, PreCloseFn pre_close)
     : m_channel(ch)
     , m_post_write(std::move(post_write))
     , m_post_io(std::move(post_io))
+    , m_pre_close(std::move(pre_close))
 {}
 
 ErrorCode SshChannel::Read(uint8_t* buf, size_t len, size_t& bytes_read) {
@@ -83,7 +84,16 @@ void SshChannel::Close() {
     LIBSSH2_CHANNEL* ch = m_channel.exchange(nullptr);
     if (!ch) return;
 
-    if (m_post_io && !s_is_io_thread) {
+    // Remove from the transport's write queue before freeing.
+    // This must happen while ch is still a valid pointer so that
+    // DrainWriteQueues cannot call libssh2_channel_write on a freed channel.
+    if (m_pre_close) m_pre_close(ch);
+
+    // Always post channel_close/free to io_callbacks — never call directly,
+    // even on the IO thread. This guarantees that any io_callbacks already
+    // queued for this channel (e.g. a SendEof posted by an IOCP thread just
+    // before Close() ran) are drained in FIFO order before channel_free fires.
+    if (m_post_io) {
         m_post_io([ch]() {
             libssh2_channel_close(ch);
             libssh2_channel_free(ch);
@@ -274,9 +284,19 @@ void SshTransport::IoThreadProc(OnChannelAccepted on_channel,
             auto post_io = [this](std::function<void()> fn) {
                 PostToIoThread(std::move(fn));
             };
+            auto pre_close = [this](LIBSSH2_CHANNEL* c) {
+                RemoveChannelWriteQueue(c);
+            };
+
+            // Register channel in the write queue eagerly so PostChannelWrite
+            // can safely discard writes for channels not found in the queue.
+            {
+                std::lock_guard<std::mutex> lock(m_queues_mutex);
+                m_write_queues.push_back(ChannelQueue{ ch, {} });
+            }
 
             auto ssh_ch = std::make_unique<SshChannel>(
-                ch, std::move(post_write), std::move(post_io));
+                ch, std::move(post_write), std::move(post_io), std::move(pre_close));
             on_channel(std::move(ssh_ch));
             continue;
         }
@@ -287,7 +307,7 @@ void SshTransport::IoThreadProc(OnChannelAccepted on_channel,
             fd_set fds;
             FD_ZERO(&fds);
             FD_SET(m_socket, &fds);
-            struct timeval tv{ 0, 100000 };  // 100 ms
+            struct timeval tv{ 0, 1000 };  // 1 ms — keeps relay latency low while sessions are active
             select(0, &fds, nullptr, nullptr, &tv);
             continue;
         }
@@ -349,6 +369,14 @@ void SshTransport::PumpSessions() {
         m_session_pumps.end());
 }
 
+void SshTransport::RemoveChannelWriteQueue(LIBSSH2_CHANNEL* ch) {
+    std::lock_guard<std::mutex> lock(m_queues_mutex);
+    m_write_queues.erase(
+        std::remove_if(m_write_queues.begin(), m_write_queues.end(),
+            [ch](const ChannelQueue& q) { return q.channel == ch; }),
+        m_write_queues.end());
+}
+
 void SshTransport::PostChannelWrite(LIBSSH2_CHANNEL* ch, std::vector<uint8_t> data) {
     std::lock_guard<std::mutex> lock(m_queues_mutex);
     for (auto& q : m_write_queues) {
@@ -357,11 +385,8 @@ void SshTransport::PostChannelWrite(LIBSSH2_CHANNEL* ch, std::vector<uint8_t> da
             return;
         }
     }
-    // New channel — add a queue entry
-    ChannelQueue q;
-    q.channel = ch;
-    q.pending.push_back(std::move(data));
-    m_write_queues.push_back(std::move(q));
+    // Channel not registered (was closed and removed) — discard silently.
+    // Never create a new entry here: the channel pointer may already be freed.
 }
 
 void SshTransport::RegisterSessionPump(SessionPumpFn fn) {

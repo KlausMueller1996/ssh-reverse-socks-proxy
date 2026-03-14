@@ -53,6 +53,11 @@ public:
     // The I/O thread drains all queues in its select loop.
     void PostChannelWrite(LIBSSH2_CHANNEL* ch, std::vector<uint8_t> data);
 
+    // Remove a channel's write queue entry (thread-safe).
+    // Called from SshChannel::Close() before channel_free is posted, ensuring
+    // DrainWriteQueues never writes to a freed LIBSSH2_CHANNEL*.
+    void RemoveChannelWriteQueue(LIBSSH2_CHANNEL* ch);
+
     // Register a pump to be called on every I/O thread loop iteration.
     // MUST be called on the SSH I/O thread (e.g. from within on_channel callback).
     void RegisterSessionPump(SessionPumpFn fn);
