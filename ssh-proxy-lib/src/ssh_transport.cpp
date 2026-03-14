@@ -205,7 +205,7 @@ ErrorCode SshTransport::Connect(const std::string& host, uint16_t port,
         "127.0.0.1",
         forward_port,
         &bound_port,
-        /*queue_maxsize=*/16);
+        /*queue_maxsize=*/128);
 
     if (!m_listener) {
         char* errmsg = nullptr;
@@ -289,6 +289,11 @@ void SshTransport::IoThreadProc(OnChannelAccepted on_channel,
             FD_SET(m_socket, &fds);
             struct timeval tv{ 0, 100000 };  // 100 ms
             select(0, &fds, nullptr, nullptr, &tv);
+            continue;
+        }
+
+        if (rc == LIBSSH2_ERROR_CHANNEL_UNKNOWN) {
+            // Stale packet arrived for a channel that was already freed — non-fatal
             continue;
         }
 
