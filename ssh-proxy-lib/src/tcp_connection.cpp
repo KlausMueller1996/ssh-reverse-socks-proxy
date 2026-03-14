@@ -21,7 +21,7 @@ ErrorCode TcpConnection::ConnectAsync(const std::string& host, uint16_t port, On
 
     // DNS resolve (blocking — called from channel context)
     struct addrinfo hints{}, *result = nullptr;
-    hints.ai_family = AF_UNSPEC;
+    hints.ai_family = AF_INET;
     hints.ai_socktype = SOCK_STREAM;
     hints.ai_protocol = IPPROTO_TCP;
 
@@ -46,19 +46,11 @@ ErrorCode TcpConnection::ConnectAsync(const std::string& host, uint16_t port, On
     // ConnectEx requires the socket to be bound
     struct sockaddr_storage bind_addr{};
     int bind_len = 0;
-    if (addr->ai_family == AF_INET) {
-        struct sockaddr_in* sa = reinterpret_cast<struct sockaddr_in*>(&bind_addr);
-        sa->sin_family = AF_INET;
-        sa->sin_addr.s_addr = INADDR_ANY;
-        sa->sin_port = 0;
-        bind_len = sizeof(struct sockaddr_in);
-    } else {
-        struct sockaddr_in6* sa = reinterpret_cast<struct sockaddr_in6*>(&bind_addr);
-        sa->sin6_family = AF_INET6;
-        sa->sin6_addr = in6addr_any;
-        sa->sin6_port = 0;
-        bind_len = sizeof(struct sockaddr_in6);
-    }
+    struct sockaddr_in* sa = reinterpret_cast<struct sockaddr_in*>(&bind_addr);
+    sa->sin_family = AF_INET;
+    sa->sin_addr.s_addr = INADDR_ANY;
+    sa->sin_port = 0;
+    bind_len = sizeof(struct sockaddr_in);
 
     if (bind(m_socket, reinterpret_cast<struct sockaddr*>(&bind_addr), bind_len) != 0) {
         Logger::Error("bind failed: %d", WSAGetLastError());
