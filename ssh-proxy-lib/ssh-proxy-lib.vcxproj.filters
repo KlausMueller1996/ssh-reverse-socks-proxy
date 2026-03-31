@@ -34,10 +34,16 @@
     <ClCompile Include="src\connect.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
+    <ClCompile Include="src\direct_forward.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
   </ItemGroup>
 
   <ItemGroup>
     <ClInclude Include="public\ssh_proxy.h">
+      <Filter>Header Files\Public</Filter>
+    </ClInclude>
+    <ClInclude Include="public\ssh_tunnel.h">
       <Filter>Header Files\Public</Filter>
     </ClInclude>
     <ClInclude Include="include\common.h">

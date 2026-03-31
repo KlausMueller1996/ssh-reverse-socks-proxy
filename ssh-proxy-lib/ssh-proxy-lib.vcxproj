@@ -103,6 +103,7 @@
     <ClInclude Include="include\socks5_session.h" />
     <ClInclude Include="include\socks5_handler.h" />
     <ClInclude Include="include\tcp_connection.h" />
+    <ClInclude Include="public\ssh_tunnel.h" />
   </ItemGroup>
 
   <!-- Sources -->
@@ -114,6 +115,7 @@
     <ClCompile Include="src\ssh_transport.cpp" />
     <ClCompile Include="src\socks5_session.cpp" />
     <ClCompile Include="src\connect.cpp" />
+    <ClCompile Include="src\direct_forward.cpp" />
   </ItemGroup>
 
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
