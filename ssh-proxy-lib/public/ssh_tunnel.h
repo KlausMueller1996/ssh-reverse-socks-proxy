@@ -38,12 +38,13 @@ public:
     uint16_t local_port() const;
 
     bool is_alive() const;
-    void cancel();
-
-    // Pimpl — exposed so relay_proc (free function) can access internals.
-    struct Impl;
 
 private:
+    struct Impl;
+    static bool accept_connection(Impl*);
+    static void run_relay_loop(Impl*);
+    static void run_relay(Impl*);
+
     Impl* m_impl;
 };
 

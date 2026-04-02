@@ -109,6 +109,16 @@ bool SshChannel::IsEof() const {
     return ch ? libssh2_channel_eof(ch) != 0 : true;
 }
 
+// Appends the libssh2 last-error string to context and returns a failed Result.
+// The message travels in the Result so the caller can propagate or display it
+// without relying on a separate log call.
+static Result ssh_error(LIBSSH2_SESSION* s, std::string context, ErrorCode code) {
+    char* errmsg = nullptr;
+    libssh2_session_last_error(s, &errmsg, nullptr, 0);
+    if (errmsg) { context += ": "; context += errmsg; }
+    return { code, std::move(context) };
+}
+
 // ── SshTransport ──────────────────────────────────────────────────────────────
 
 SshTransport::SshTransport() = default;
@@ -117,14 +127,19 @@ SshTransport::~SshTransport() {
     Close();
 }
 
-ErrorCode SshTransport::Connect(const std::string& host, uint16_t port,
-                                 const std::string& username,
-                                 const std::string& password,
-                                 uint16_t forward_port,
-                                 uint32_t timeout_ms,
-                                 uint32_t keepalive_interval_ms) {
+Result SshTransport::Connect(const std::string& host, uint16_t port,
+                              const std::string& username,
+                              const std::string& password,
+                              uint16_t forward_port,
+                              uint32_t timeout_ms,
+                              uint32_t keepalive_interval_ms) {
+    // All resources are held in local RAII guards.  Any early return below
+    // automatically destroys them in reverse declaration order — no explicit
+    // per-branch cleanup required.  On success, .release() transfers ownership
+    // to the SshTransport members, where Close() manages their lifetime.
+
     // ── TCP connect ───────────────────────────────────────────────────────────
-    struct addrinfo hints{}, *result = nullptr;
+    struct addrinfo hints{};
     hints.ai_family   = AF_UNSPEC;
     hints.ai_socktype = SOCK_STREAM;
     hints.ai_protocol = IPPROTO_TCP;
@@ -132,58 +147,44 @@ ErrorCode SshTransport::Connect(const std::string& host, uint16_t port,
     char port_str[8];
     snprintf(port_str, sizeof(port_str), "%u", port);
 
-    if (getaddrinfo(host.c_str(), port_str, &hints, &result) != 0 || !result) {
-        Logger::Error("DNS resolve failed for %s", host.c_str());
-        return ErrorCode::DnsResolutionFailed;
-    }
+    addrinfo* raw_addr = nullptr;
+    if (getaddrinfo(host.c_str(), port_str, &hints, &raw_addr) != 0 || !raw_addr)
+        return { ErrorCode::DnsResolutionFailed, "DNS resolve failed for " + host };
+    AddrInfoPtr addr(raw_addr);
 
-    m_socket = socket(result->ai_family, SOCK_STREAM, IPPROTO_TCP);
-    if (m_socket == INVALID_SOCKET) {
-        freeaddrinfo(result);
-        Logger::Error("socket() failed: %d", WSAGetLastError());
-        return ErrorCode::SocketError;
-    }
+    WinSocket sock(socket(addr->ai_family, SOCK_STREAM, IPPROTO_TCP));
+    if (!sock)
+        return { ErrorCode::SocketError,
+                 "socket() failed: " + std::to_string(WSAGetLastError()) };
 
     // Apply connect timeout via SO_RCVTIMEO/SO_SNDTIMEO on a blocking socket
     DWORD tv_ms = timeout_ms;
-    setsockopt(m_socket, SOL_SOCKET, SO_RCVTIMEO, reinterpret_cast<const char*>(&tv_ms), sizeof(tv_ms));
-    setsockopt(m_socket, SOL_SOCKET, SO_SNDTIMEO, reinterpret_cast<const char*>(&tv_ms), sizeof(tv_ms));
+    setsockopt(sock.get(), SOL_SOCKET, SO_RCVTIMEO, reinterpret_cast<const char*>(&tv_ms), sizeof(tv_ms));
+    setsockopt(sock.get(), SOL_SOCKET, SO_SNDTIMEO, reinterpret_cast<const char*>(&tv_ms), sizeof(tv_ms));
 
-    if (::connect(m_socket, result->ai_addr, static_cast<int>(result->ai_addrlen)) != 0) {
+    if (::connect(sock.get(), addr->ai_addr, static_cast<int>(addr->ai_addrlen)) != 0) {
         int err = WSAGetLastError();
-        freeaddrinfo(result);
-        closesocket(m_socket);
-        m_socket = INVALID_SOCKET;
-        Logger::Error("TCP connect to %s:%u failed: %d", host.c_str(), port, err);
-        return WsaToErrorCode(err);
+        return { WsaToErrorCode(err),
+                 "TCP connect to " + host + ":" + std::to_string(port) +
+                 " failed (WSA " + std::to_string(err) + ")" };
     }
-    freeaddrinfo(result);
+    addr.reset();
     Logger::Info("TCP connected to %s:%u", host.c_str(), port);
 
     // ── libssh2 session ───────────────────────────────────────────────────────
-    m_session = libssh2_session_init();
-    if (!m_session) {
-        closesocket(m_socket);
-        m_socket = INVALID_SOCKET;
-        Logger::Error("libssh2_session_init failed");
-        return ErrorCode::SshHandshakeFailed;
-    }
+    SshSessionPtr session(libssh2_session_init());
+    if (!session)
+        return { ErrorCode::SshHandshakeFailed, "libssh2_session_init failed" };
 
-    libssh2_session_set_blocking(m_session, 1);
+    libssh2_session_set_blocking(session.get(), 1);
 
-    if (libssh2_session_handshake(m_session, m_socket) != 0) {
-        char* errmsg = nullptr;
-        libssh2_session_last_error(m_session, &errmsg, nullptr, 0);
-        Logger::Error("SSH handshake failed: %s", errmsg ? errmsg : "unknown");
-        libssh2_session_free(m_session);
-        m_session = nullptr;
-        closesocket(m_socket);
-        m_socket = INVALID_SOCKET;
-        return ErrorCode::SshHandshakeFailed;
-    }
+    if (libssh2_session_handshake(session.get(), sock.get()) != 0)
+        return ssh_error(session.get(), "SSH handshake failed", ErrorCode::SshHandshakeFailed);
+    // Handshake complete — deleter may now send SSH_MSG_DISCONNECT on cleanup.
+    session.get_deleter().send_disconnect = true;
 
     // Log host key fingerprint at DEBUG (trust-all policy — no verification)
-    const char* fingerprint = libssh2_hostkey_hash(m_session, LIBSSH2_HOSTKEY_HASH_SHA256);
+    const char* fingerprint = libssh2_hostkey_hash(session.get(), LIBSSH2_HOSTKEY_HASH_SHA256);
     if (fingerprint) {
         char fp_hex[65] = {};
         for (int i = 0; i < 32; ++i)
@@ -192,56 +193,36 @@ ErrorCode SshTransport::Connect(const std::string& host, uint16_t port,
     }
 
     // ── Password authentication ───────────────────────────────────────────────
-    if (libssh2_userauth_password(m_session,
-                                  username.c_str(),
-                                  password.c_str()) != 0) {
-        char* errmsg = nullptr;
-        libssh2_session_last_error(m_session, &errmsg, nullptr, 0);
-        Logger::Error("SSH auth failed for user '%s': %s",
-                      username.c_str(), errmsg ? errmsg : "unknown");
-        libssh2_session_disconnect(m_session, "Auth failed");
-        libssh2_session_free(m_session);
-        m_session = nullptr;
-        closesocket(m_socket);
-        m_socket = INVALID_SOCKET;
-        return ErrorCode::SshAuthFailed;
-    }
+    if (libssh2_userauth_password(session.get(), username.c_str(), password.c_str()) != 0)
+        return ssh_error(session.get(), "SSH auth failed for user '" + username + "'",
+                         ErrorCode::SshAuthFailed);
     Logger::Info("SSH authenticated as '%s'", username.c_str());
 
     // ── Remote port forwarding ────────────────────────────────────────────────
+    // SshListenerPtr declared after SshSessionPtr so it is destroyed first,
+    // before the session is freed (forward_cancel requires a live session).
     int bound_port = 0;
-    m_listener = libssh2_channel_forward_listen_ex(
-        m_session,
-        "127.0.0.1",
-        forward_port,
-        &bound_port,
-        /*queue_maxsize=*/128);
-
-    if (!m_listener) {
-        char* errmsg = nullptr;
-        libssh2_session_last_error(m_session, &errmsg, nullptr, 0);
-        Logger::Error("tcpip-forward request failed (port %u): %s",
-                      forward_port, errmsg ? errmsg : "unknown");
-        libssh2_session_disconnect(m_session, "Forward failed");
-        libssh2_session_free(m_session);
-        m_session = nullptr;
-        closesocket(m_socket);
-        m_socket = INVALID_SOCKET;
-        return ErrorCode::SshChannelOpenFailed;
-    }
+    SshListenerPtr listener(libssh2_channel_forward_listen_ex(
+        session.get(), "127.0.0.1", forward_port, &bound_port, /*queue_maxsize=*/128));
+    if (!listener)
+        return ssh_error(session.get(), "tcpip-forward request failed (port " +
+                         std::to_string(forward_port) + ")", ErrorCode::SshChannelOpenFailed);
     Logger::Info("Remote port forwarding active: 127.0.0.1:%d → SOCKS5", bound_port);
 
     // Configure keepalives
-    if (keepalive_interval_ms > 0) {
-        libssh2_keepalive_config(m_session, 1,
+    if (keepalive_interval_ms > 0)
+        libssh2_keepalive_config(session.get(), 1,
             static_cast<unsigned>(keepalive_interval_ms / 1000));
-    }
 
     // Switch to non-blocking for the accept loop
-    libssh2_session_set_blocking(m_session, 0);
+    libssh2_session_set_blocking(session.get(), 0);
 
+    // ── All resources acquired — commit to members ────────────────────────────
+    m_socket   = sock.release();
+    m_session  = session.release();
+    m_listener = listener.release();
     m_connected.store(true);
-    return ErrorCode::Success;
+    return {};
 }
 
 void SshTransport::StartAccepting(OnChannelAccepted on_channel,

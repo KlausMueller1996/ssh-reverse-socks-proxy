@@ -13,3 +13,5 @@ SPEC.md
 # VS Code personal environment files
 .vscode/settings.json
 .vscode/c_cpp_properties.json
+ousterhout-review.md
+LIBSSH2_OVERVIEW.md

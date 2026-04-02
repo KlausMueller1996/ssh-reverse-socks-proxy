@@ -17,12 +17,14 @@
 
 #include <cstdint>
 #include <cstddef>
+#include <cstdio>
 #include <cstring>
 #include <vector>
 #include <string>
 #include <memory>
 #include <functional>
 #include <algorithm>
+#include <stdexcept>
 
 // Shared type alias
 using ByteBuffer = std::vector<uint8_t>;
@@ -92,4 +94,132 @@ inline ErrorCode WsaToErrorCode(int wsa_error) {
     case WSAENETUNREACH: return ErrorCode::NetworkUnreachable;
     default:             return ErrorCode::SocketError;
     }
+}
+
+// A result type that pairs an ErrorCode with an optional diagnostic message.
+// Used by setup functions that cannot throw but need to propagate a human-readable
+// reason alongside the category code.  Callers check ok() and read what() for display.
+struct Result {
+    ErrorCode   code    = ErrorCode::Success;
+    std::string message;
+
+    Result() = default;                                           // success
+    explicit Result(ErrorCode c) : code(c) {}                    // code only
+    Result(ErrorCode c, std::string msg)
+        : code(c), message(std::move(msg)) {}
+
+    bool ok() const { return code == ErrorCode::Success; }
+
+    // Returns the diagnostic message if one was set, otherwise the enum name.
+    const char* what() const {
+        return message.empty() ? ErrorCodeToString(code) : message.c_str();
+    }
+};
+
+// ── RAII handles ──────────────────────────────────────────────────────────────
+// Used as local guards in setup functions (constructors / Connect).
+// On success, call .release() to hand ownership to the owning member.
+// On any early return or throw, the destructor fires automatically —
+// no per-branch cleanup code required.
+
+// LIBSSH2_SESSION* — set_blocking(1) → [optional disconnect] → free.
+// send_disconnect defaults to false so that the deleter is safe to use
+// before the handshake completes (no SSH transport to send over yet).
+// Set ptr.get_deleter().send_disconnect = true after libssh2_session_handshake
+// succeeds, so that subsequent cleanup sends a clean SSH_MSG_DISCONNECT.
+struct SshSessionDeleter {
+    bool send_disconnect = false;
+    void operator()(LIBSSH2_SESSION* s) const {
+        libssh2_session_set_blocking(s, 1);
+        if (send_disconnect)
+            libssh2_session_disconnect(s, "Shutdown");
+        libssh2_session_free(s);
+    }
+};
+using SshSessionPtr = std::unique_ptr<LIBSSH2_SESSION, SshSessionDeleter>;
+
+// LIBSSH2_CHANNEL* — close → free.
+struct SshChannelDeleter {
+    void operator()(LIBSSH2_CHANNEL* c) const {
+        libssh2_channel_close(c);
+        libssh2_channel_free(c);
+    }
+};
+using SshChannelPtr = std::unique_ptr<LIBSSH2_CHANNEL, SshChannelDeleter>;
+
+// LIBSSH2_LISTENER* — forward_cancel (also frees the listener object).
+// NOTE: the owning session must still be alive when the deleter fires.
+// Declare SshListenerPtr *after* SshSessionPtr in any local scope so that
+// C++ destroys it first (reverse declaration order), before the session.
+struct SshListenerDeleter {
+    void operator()(LIBSSH2_LISTENER* l) const {
+        libssh2_channel_forward_cancel(l);
+    }
+};
+using SshListenerPtr = std::unique_ptr<LIBSSH2_LISTENER, SshListenerDeleter>;
+
+// SOCKET is a UINT_PTR (integer handle), not a pointer, so unique_ptr
+// cannot wrap it directly.  WinSocket is a minimal move-only RAII guard.
+struct WinSocket {
+    SOCKET s = INVALID_SOCKET;
+
+    WinSocket() = default;
+    explicit WinSocket(SOCKET sock) : s(sock) {}
+    ~WinSocket()                               { close(); }
+    WinSocket(WinSocket&& o) noexcept          : s(o.s) { o.s = INVALID_SOCKET; }
+    WinSocket& operator=(WinSocket&& o) noexcept {
+        if (this != &o) { close(); s = o.s; o.s = INVALID_SOCKET; }
+        return *this;
+    }
+    WinSocket(const WinSocket&)            = delete;
+    WinSocket& operator=(const WinSocket&) = delete;
+
+    SOCKET get()    const { return s; }
+    SOCKET release()      { SOCKET t = s; s = INVALID_SOCKET; return t; }
+    explicit operator bool() const { return s != INVALID_SOCKET; }
+
+private:
+    void close() { if (s != INVALID_SOCKET) { closesocket(s); s = INVALID_SOCKET; } }
+};
+
+// addrinfo* — freeaddrinfo.
+struct AddrInfoDeleter {
+    void operator()(addrinfo* ai) const { freeaddrinfo(ai); }
+};
+using AddrInfoPtr = std::unique_ptr<addrinfo, AddrInfoDeleter>;
+
+// ── connect_tcp ───────────────────────────────────────────────────────────────
+// DNS-resolve host:port and establish a blocking TCP connection with a
+// send/receive timeout. Returns the connected WinSocket; throws
+// std::runtime_error on any failure.
+inline WinSocket connect_tcp(const std::string& host, uint16_t port, uint32_t timeout_ms)
+{
+    struct addrinfo hints{};
+    hints.ai_family   = AF_UNSPEC;
+    hints.ai_socktype = SOCK_STREAM;
+    hints.ai_protocol = IPPROTO_TCP;
+
+    char port_str[8];
+    ::snprintf(port_str, sizeof(port_str), "%u", static_cast<unsigned>(port));
+
+    addrinfo* raw_addr = nullptr;
+    if (::getaddrinfo(host.c_str(), port_str, &hints, &raw_addr) != 0)
+        throw std::runtime_error("DNS resolve failed for " + host);
+    if (raw_addr == nullptr)
+        throw std::runtime_error("getaddrinfo returned null for " + host);
+
+    AddrInfoPtr addr(raw_addr);
+
+    WinSocket sock(::socket(addr->ai_family, SOCK_STREAM, IPPROTO_TCP));
+    if (sock.get() == INVALID_SOCKET)
+        throw std::runtime_error("socket() failed for " + host);
+
+    DWORD tv_ms = timeout_ms;
+    ::setsockopt(sock.get(), SOL_SOCKET, SO_RCVTIMEO, reinterpret_cast<const char*>(&tv_ms), sizeof(tv_ms));
+    ::setsockopt(sock.get(), SOL_SOCKET, SO_SNDTIMEO, reinterpret_cast<const char*>(&tv_ms), sizeof(tv_ms));
+
+    if (::connect(sock.get(), addr->ai_addr, static_cast<int>(addr->ai_addrlen)) != 0)
+        throw std::runtime_error("TCP connect to " + host + " failed: " + std::to_string(::WSAGetLastError()));
+
+    return sock;
 }

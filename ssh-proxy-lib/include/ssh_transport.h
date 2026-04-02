@@ -31,12 +31,12 @@ public:
     SshTransport& operator=(const SshTransport&) = delete;
 
     // Blocking: TCP connect + SSH handshake + password auth + tcpip-forward request.
-    // Returns ErrorCode::Success or a relevant error.
+    // Returns Result::ok() on success; on failure Result::what() carries the reason.
     // Must be called before StartAccepting().
-    ErrorCode Connect(const std::string& host, uint16_t port,
-                      const std::string& username, const std::string& password,
-                      uint16_t forward_port, uint32_t timeout_ms,
-                      uint32_t keepalive_interval_ms);
+    Result Connect(const std::string& host, uint16_t port,
+                   const std::string& username, const std::string& password,
+                   uint16_t forward_port, uint32_t timeout_ms,
+                   uint32_t keepalive_interval_ms);
 
     // Spawns the I/O thread. on_channel fires for each accepted forwarded-tcpip
     // channel; on_disconnect fires once when the session drops.
