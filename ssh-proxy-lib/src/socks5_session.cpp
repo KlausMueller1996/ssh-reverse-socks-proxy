@@ -11,28 +11,7 @@ Socks5Session::~Socks5Session() {
 }
 
 void Socks5Session::Start() {
-    ReadFromChannel();
-}
-
-void Socks5Session::ReadFromChannel() {
-    if (m_state.load() == State::Closed) return;
-
-    uint8_t buf[4096];
-    size_t bytes_read = 0;
-    ErrorCode ec;
-
-    // Loop on WouldBlock: on the SSH I/O thread, spin-wait until data arrives.
-    do {
-        ec = m_channel->Read(buf, sizeof(buf), bytes_read);
-        if (ec == ErrorCode::WouldBlock) Sleep(1);
-    } while (ec == ErrorCode::WouldBlock);
-
-    if (ec != ErrorCode::Success || bytes_read == 0) {
-        Close();
-        return;
-    }
-
-    OnChannelData(buf, bytes_read);
+    // Full lifecycle (handshake + relay) is driven non-blocking by PumpSshRead().
 }
 
 void Socks5Session::OnChannelData(const uint8_t* data, size_t len) {
@@ -54,10 +33,8 @@ void Socks5Session::HandleMethodNegotiation(const uint8_t* data, size_t len) {
     bool supports_no_auth = false;
     int consumed = Socks5::ParseMethodRequest(data, len, supports_no_auth);
 
-    if (consumed == 0) {
-        ReadFromChannel();  // need more data
-        return;
-    }
+    if (consumed == 0) return;  // need more data; PumpSshRead delivers next iteration
+
     if (consumed < 0 || !supports_no_auth) {
         Logger::Warn("SOCKS5: method negotiation failed (no-auth not offered)");
         auto reply = Socks5::BuildMethodResponse(Socks5::AUTH_NO_ACCEPTABLE);
@@ -71,17 +48,18 @@ void Socks5Session::HandleMethodNegotiation(const uint8_t* data, size_t len) {
     m_channel->Write(reply.data(), reply.size());
 
     m_state.store(State::ReadingRequest);
-    ReadFromChannel();
+
+    // If data was left over in m_inbound_buf, process it immediately.
+    if (!m_inbound_buf.empty())
+        HandleConnectRequest(m_inbound_buf.data(), m_inbound_buf.size());
 }
 
 void Socks5Session::HandleConnectRequest(const uint8_t* data, size_t len) {
     Socks5::ConnectRequest req{};
     int consumed = Socks5::ParseConnectRequest(data, len, req);
 
-    if (consumed == 0) {
-        ReadFromChannel();  // need more data
-        return;
-    }
+    if (consumed == 0) return;  // need more data; PumpSshRead delivers next iteration
+
     if (consumed < 0) {
         Logger::Warn("SOCKS5: malformed connect request");
         auto reply = Socks5::BuildConnectReply(Socks5::REP_GENERAL_FAILURE);
@@ -90,16 +68,8 @@ void Socks5Session::HandleConnectRequest(const uint8_t* data, size_t len) {
         return;
     }
 
+    // atyp already validated by ParseConnectRequest (returns -1 on unknown type).
     m_inbound_buf.erase(m_inbound_buf.begin(), m_inbound_buf.begin() + consumed);
-
-    if (req.atyp != Socks5::ATYP_IPV4 &&
-        req.atyp != Socks5::ATYP_IPV6 &&
-        req.atyp != Socks5::ATYP_DOMAIN) {
-        auto reply = Socks5::BuildConnectReply(Socks5::REP_ADDRESS_TYPE_NOT_SUPPORTED);
-        m_channel->Write(reply.data(), reply.size());
-        Close();
-        return;
-    }
 
     Logger::Debug("SOCKS5: CONNECT %s:%u", req.host.c_str(), req.port);
     StartTcpConnect(req);
@@ -160,10 +130,11 @@ void Socks5Session::StartRelay() {
 
 bool Socks5Session::PumpSshRead() {
     // Called on the SSH I/O thread every loop iteration.
+    // Drives all states: ReadingMethods, ReadingRequest, Relaying.
 
     State s = m_state.load();
     if (s == State::Closed) return false;
-    if (s != State::Relaying) return true;  // still in handshake; keep pump alive
+    if (s == State::Connecting) return true;  // waiting for TCP connect callback
 
     uint8_t buf[4096];
     size_t bytes_read = 0;
@@ -176,8 +147,13 @@ bool Socks5Session::PumpSshRead() {
         return false;
     }
 
-    m_tcp->Send(buf, bytes_read);
-    return true;
+    if (s == State::Relaying) {
+        m_tcp->Send(buf, bytes_read);
+    } else {
+        OnChannelData(buf, bytes_read);
+    }
+
+    return m_state.load() != State::Closed;
 }
 
 void Socks5Session::Close() {

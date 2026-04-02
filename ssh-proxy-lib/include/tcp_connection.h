@@ -3,6 +3,7 @@
 #include "async_io.h"
 #include <atomic>
 #include <memory>
+#include <mutex>
 #include <string>
 #include <queue>
 
@@ -24,8 +25,8 @@ public:
     TcpConnection& operator=(const TcpConnection&) = delete;
 
     // Post DNS resolution + async connect to an IOCP worker thread.
-    // Returns immediately (non-blocking). Callback fires on IOCP thread.
-    ErrorCode ConnectAsync(const std::string& host, uint16_t port, OnConnected on_connected);
+    // Fire-and-forget: returns immediately; all results arrive via on_connected callback.
+    void ConnectAsync(const std::string& host, uint16_t port, OnConnected on_connected);
 
     // Start async reads. Data delivered via on_data on IOCP threads.
     void StartReading(OnDataReceived on_data, OnDisconnected on_disconnect);
@@ -46,18 +47,18 @@ private:
     void FlushSendQueue();
     void OnSendComplete(IoContext* ctx, DWORD bytes, ErrorCode ec);
 
-    SOCKET              m_socket;
-    bool                m_connected;
-    bool                m_reading;
-    std::atomic<bool>   m_abort{false};  // set by Close(); guards DoConnectOnWorkerThread
+    SOCKET                m_socket;
+    std::atomic<bool>     m_connected{false};
+    std::atomic<bool>     m_reading{false};
+    std::atomic<bool>     m_abort{false};   // set by Close(); guards DoConnectOnWorkerThread
 
-    IoContext            m_dns_ctx;      // work item: DNS + connect setup on worker thread
-    IoContext            m_connect_ctx;
-    IoContext            m_recv_ctx;
-    IoContext            m_send_ctx;
-    bool                m_send_in_progress;
+    IoContext             m_dns_ctx;        // work item: DNS + connect setup on worker thread
+    IoContext             m_connect_ctx;
+    IoContext             m_recv_ctx;
+    IoContext             m_send_ctx;
+    bool                  m_send_in_progress;
 
-    CRITICAL_SECTION    m_send_cs;
+    std::mutex            m_send_mutex;
     std::queue<ByteBuffer> m_send_queue;
 
     OnConnected          m_on_connected;

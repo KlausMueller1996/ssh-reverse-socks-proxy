@@ -57,7 +57,46 @@ namespace ssh_tunnel {
         std::atomic<bool>   m_alive{ true };
     };
 
-    namespace { 
+    namespace {
+
+        //
+        // ── connect_tcp ───────────────────────────────────────────────────────────────
+        //
+        // DNS-resolve host:port and establish a blocking TCP connection with a
+        // send/receive timeout. Returns the connected WinSocket; throws
+        // std::runtime_error on any failure.
+
+        WinSocket connect_tcp(const std::string& host, uint16_t port, uint32_t timeout_ms)
+        {
+            struct addrinfo hints{};
+            hints.ai_family   = AF_UNSPEC;
+            hints.ai_socktype = SOCK_STREAM;
+            hints.ai_protocol = IPPROTO_TCP;
+
+            char port_str[8];
+            ::snprintf(port_str, sizeof(port_str), "%u", static_cast<unsigned>(port));
+
+            addrinfo* raw_addr = nullptr;
+            if (::getaddrinfo(host.c_str(), port_str, &hints, &raw_addr) != 0)
+                throw std::runtime_error("DNS resolve failed for " + host);
+            if (raw_addr == nullptr)
+                throw std::runtime_error("getaddrinfo returned null for " + host);
+
+            AddrInfoPtr addr(raw_addr);
+
+            WinSocket sock(::socket(addr->ai_family, SOCK_STREAM, IPPROTO_TCP));
+            if (sock.get() == INVALID_SOCKET)
+                throw std::runtime_error("socket() failed for " + host);
+
+            DWORD tv_ms = timeout_ms;
+            ::setsockopt(sock.get(), SOL_SOCKET, SO_RCVTIMEO, reinterpret_cast<const char*>(&tv_ms), sizeof(tv_ms));
+            ::setsockopt(sock.get(), SOL_SOCKET, SO_SNDTIMEO, reinterpret_cast<const char*>(&tv_ms), sizeof(tv_ms));
+
+            if (::connect(sock.get(), addr->ai_addr, static_cast<int>(addr->ai_addrlen)) != 0)
+                throw std::runtime_error("TCP connect to " + host + " failed: " + std::to_string(::WSAGetLastError()));
+
+            return sock;
+        }
 
         //
         // ── throw_ssh_error ───────────────────────────────────────────────────────────

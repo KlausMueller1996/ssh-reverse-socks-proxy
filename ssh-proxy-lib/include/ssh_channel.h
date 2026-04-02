@@ -31,10 +31,10 @@ public:
 // Concrete implementation wrapping a LIBSSH2_CHANNEL*.
 //
 // libssh2 is not thread-safe. Read/IsEof must only be called on the SSH I/O
-// thread. Write/SendEof/Close are thread-safe: when a PostWriteFn / PostIoFn
-// is provided (set by SshTransport when accepting a channel), calls arriving
-// from IOCP worker threads are marshalled back to the I/O thread via queues
-// instead of touching libssh2 directly.
+// thread. Write/SendEof/Close are thread-safe: when ThreadingHooks are provided
+// (set by SshTransport when accepting a channel), calls arriving from IOCP worker
+// threads are marshalled back to the I/O thread via queues instead of touching
+// libssh2 directly.
 class SshChannel : public IChannel {
 public:
     // Posts write data to the SSH I/O thread's per-channel queue.
@@ -46,10 +46,16 @@ public:
     // still valid, preventing DrainWriteQueues from writing to a freed channel.
     using PreCloseFn   = std::function<void(LIBSSH2_CHANNEL*)>;
 
-    explicit SshChannel(LIBSSH2_CHANNEL* ch,
-                        PostWriteFn post_write = {},
-                        PostIoFn    post_io    = {},
-                        PreCloseFn  pre_close  = {});
+    // Transport-internal thread-marshalling hooks — grouped as a single parameter
+    // so callers read them as one "transport plumbing" concern rather than three
+    // independent callbacks.
+    struct ThreadingHooks {
+        PostWriteFn post_write;
+        PostIoFn    post_io;
+        PreCloseFn  pre_close;
+    };
+
+    explicit SshChannel(LIBSSH2_CHANNEL* ch, ThreadingHooks hooks = {});
     ~SshChannel() override { Close(); }
 
     SshChannel(const SshChannel&) = delete;
@@ -63,7 +69,5 @@ public:
 
 private:
     std::atomic<LIBSSH2_CHANNEL*> m_channel;
-    PostWriteFn                   m_post_write;
-    PostIoFn                      m_post_io;
-    PreCloseFn                    m_pre_close;
+    ThreadingHooks                m_hooks;
 };

@@ -16,13 +16,17 @@
 // for concurrent Connect/Close calls — use from a single controlling thread.
 class SshTransport {
 public:
-    // Fires on the SSH I/O thread for each inbound forwarded-tcpip channel.
-    using OnChannelAccepted = std::function<void(std::unique_ptr<SshChannel>)>;
-    // Fires on the SSH I/O thread when the session drops.
-    using OnDisconnected    = std::function<void(ErrorCode)>;
     // Called on every I/O thread loop iteration. Returns false when done
     // (automatically removed from the pump list).
     using SessionPumpFn     = std::function<bool()>;
+
+    // Fires on the SSH I/O thread for each inbound forwarded-tcpip channel.
+    // The returned SessionPumpFn (if non-null) is auto-registered as a per-iteration
+    // pump — callers do not need to call RegisterSessionPump separately.
+    using OnChannelAccepted = std::function<SessionPumpFn(std::unique_ptr<SshChannel>)>;
+
+    // Fires on the SSH I/O thread when the session drops.
+    using OnDisconnected    = std::function<void(ErrorCode)>;
 
     SshTransport();
     ~SshTransport();
@@ -49,32 +53,30 @@ public:
 
     bool IsConnected() const;
 
-    // Post data to a channel's write queue (thread-safe — called from IOCP threads).
-    // The I/O thread drains all queues in its select loop.
-    void PostChannelWrite(LIBSSH2_CHANNEL* ch, std::vector<uint8_t> data);
-
-    // Remove a channel's write queue entry (thread-safe).
-    // Called from SshChannel::Close() before channel_free is posted, ensuring
-    // DrainWriteQueues never writes to a freed LIBSSH2_CHANNEL*.
-    void RemoveChannelWriteQueue(LIBSSH2_CHANNEL* ch);
-
-    // Register a pump to be called on every I/O thread loop iteration.
-    // MUST be called on the SSH I/O thread (e.g. from within on_channel callback).
-    void RegisterSessionPump(SessionPumpFn fn);
-
-    // Post a callback to run on the SSH I/O thread. Thread-safe.
-    // Used by SshChannel to marshal SendEof/Close from IOCP threads.
-    void PostToIoThread(std::function<void()> fn);
-
 private:
     void IoThreadProc(OnChannelAccepted on_channel, OnDisconnected on_disconnect);
     void DrainWriteQueues();
     void DrainIoCallbacks();
     void PumpSessions();
 
-    SOCKET            m_socket  = INVALID_SOCKET;
-    LIBSSH2_SESSION*  m_session = nullptr;
-    LIBSSH2_LISTENER* m_listener = nullptr;
+    // Post data to a channel's write queue (thread-safe — called from IOCP threads).
+    void PostChannelWrite(LIBSSH2_CHANNEL* ch, std::vector<uint8_t> data);
+
+    // Remove a channel's write queue entry (thread-safe).
+    void RemoveChannelWriteQueue(LIBSSH2_CHANNEL* ch);
+
+    // Post a callback to run on the SSH I/O thread. Thread-safe.
+    void PostToIoThread(std::function<void()> fn);
+
+    // Register a pump to be called on every I/O thread loop iteration.
+    // MUST be called on the SSH I/O thread.
+    void RegisterSessionPump(SessionPumpFn fn);
+
+    // SSH resources — declared in this order so m_listener is destroyed before
+    // m_session (C++ destroys members in reverse declaration order).
+    WinSocket         m_socket;
+    SshSessionPtr     m_session;
+    SshListenerPtr    m_listener;
 
     std::thread       m_io_thread;
     std::atomic<bool> m_cancel{false};

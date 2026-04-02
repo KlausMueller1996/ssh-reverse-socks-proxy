@@ -34,7 +34,6 @@ int ParseConnectRequest(const uint8_t* data, size_t len, ConnectRequest& out) {
     if (data[0] != VERSION) return -1;
 
     uint8_t cmd = data[1];
-    // uint8_t rsv = data[2]; // reserved
     uint8_t atyp = data[3];
     out.atyp = atyp;
 

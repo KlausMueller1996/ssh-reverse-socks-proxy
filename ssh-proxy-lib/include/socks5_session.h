@@ -20,17 +20,23 @@ public:
     Socks5Session(const Socks5Session&) = delete;
     Socks5Session& operator=(const Socks5Session&) = delete;
 
-    // Begin the SOCKS5 handshake. Must be called on the SSH I/O thread.
-    // The session manages its own lifetime via shared_ptr once started.
+    // Called on the SSH I/O thread once the session is set up.
+    // Currently a no-op: the full lifecycle (handshake through relay) is driven
+    // non-blocking by PumpSshRead(). Kept for call-site clarity.
     void Start();
 
-    // Called by the SSH I/O thread on every loop iteration once the session is
-    // registered as a pump. Reads pending data from the SSH channel and forwards
-    // it to the target TCP connection. Returns false when the session is done
-    // (caller should deregister the pump).
+    // Called by the SSH I/O thread on every loop iteration.
+    // Drives the full session lifecycle: SOCKS5 handshake (ReadingMethods /
+    // ReadingRequest) and bidirectional relay (Relaying) without blocking.
+    // Returns false when the session is done (pump will be deregistered).
     bool PumpSshRead();
 
 private:
+    // State machine transitions:
+    //
+    //   ReadingMethods → ReadingRequest → Connecting → Relaying → Closed
+    //                                                              ↑
+    //                       error or EOF at any phase ────────────┘
     enum class State {
         ReadingMethods,
         ReadingRequest,
@@ -39,8 +45,6 @@ private:
         Closed,
     };
 
-    // Called on the SSH I/O thread to read from the SSH channel.
-    void ReadFromChannel();
     void OnChannelData(const uint8_t* data, size_t len);
 
     void HandleMethodNegotiation(const uint8_t* data, size_t len);

@@ -2,6 +2,10 @@
 #include <cstdint>
 #include <string>
 
+// This library exposes two entry points:
+//   ssh_proxy::Connect   (this header)  — reverse SOCKS5 proxy over an SSH tunnel
+//   ssh_tunnel::DirectForward (ssh_tunnel.h) — SSH local port forward (direct-tcpip)
+
 namespace ssh_proxy {
 
 // ── Log level ──────────────────────────────────────────────────────────────────

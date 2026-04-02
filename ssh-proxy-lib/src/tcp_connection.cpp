@@ -4,32 +4,26 @@
 
 TcpConnection::TcpConnection()
     : m_socket(INVALID_SOCKET)
-    , m_connected(false)
-    , m_reading(false)
     , m_send_in_progress(false)
-{
-    InitializeCriticalSection(&m_send_cs);
-}
+{}
 
 TcpConnection::~TcpConnection() {
     Close();
-    DeleteCriticalSection(&m_send_cs);
 }
 
-ErrorCode TcpConnection::ConnectAsync(const std::string& host, uint16_t port,
-                                       OnConnected on_connected) {
+void TcpConnection::ConnectAsync(const std::string& host, uint16_t port,
+                                  OnConnected on_connected) {
     m_on_connected = std::move(on_connected);
 
     // Post DNS + socket setup as a work item on an IOCP worker thread so the
     // SSH I/O thread is not blocked by getaddrinfo.
     ZeroMemory(static_cast<OVERLAPPED*>(&m_dns_ctx), sizeof(OVERLAPPED));
-    m_dns_ctx.op = IoOp::Timer;  // repurposed as a generic work item
+    m_dns_ctx.op = IoOp::Work;
     m_dns_ctx.callback = [self = shared_from_this(), host, port]
                          (IoContext*, DWORD, ErrorCode) mutable {
         self->DoConnectOnWorkerThread(std::move(host), port);
     };
     IoEngine::PostCompletion(&m_dns_ctx);
-    return ErrorCode::Success;
 }
 
 void TcpConnection::DoConnectOnWorkerThread(std::string host, uint16_t port) {
@@ -110,7 +104,7 @@ void TcpConnection::DoConnectOnWorkerThread(std::string host, uint16_t port) {
         if (ec2 == ErrorCode::Success) {
             setsockopt(self->m_socket, SOL_SOCKET, SO_UPDATE_CONNECT_CONTEXT,
                        nullptr, 0);
-            self->m_connected = true;
+            self->m_connected.store(true);
             Logger::Debug("Target connected (socket %llu)",
                           static_cast<unsigned long long>(self->m_socket));
         }
@@ -138,12 +132,12 @@ void TcpConnection::DoConnectOnWorkerThread(std::string host, uint16_t port) {
 void TcpConnection::StartReading(OnDataReceived on_data, OnDisconnected on_disconnect) {
     m_on_data       = std::move(on_data);
     m_on_disconnect = std::move(on_disconnect);
-    m_reading = true;
+    m_reading.store(true);
     PostRecv();
 }
 
 void TcpConnection::PostRecv() {
-    if (!m_connected || !m_reading) return;
+    if (!m_connected.load() || !m_reading.load()) return;
 
     ZeroMemory(static_cast<OVERLAPPED*>(&m_recv_ctx), sizeof(OVERLAPPED));
     m_recv_ctx.op            = IoOp::Recv;
@@ -162,7 +156,7 @@ void TcpConnection::PostRecv() {
         int err = WSAGetLastError();
         if (err != WSA_IO_PENDING) {
             Logger::Debug("WSARecv on target failed: %d", err);
-            m_reading = false;
+            m_reading.store(false);
             if (m_on_disconnect) m_on_disconnect(WsaToErrorCode(err));
         }
     }
@@ -170,7 +164,7 @@ void TcpConnection::PostRecv() {
 
 void TcpConnection::OnRecvComplete(IoContext* /*ctx*/, DWORD bytes, ErrorCode ec) {
     if (ec != ErrorCode::Success || bytes == 0) {
-        m_reading = false;
+        m_reading.store(false);
         if (m_on_disconnect)
             m_on_disconnect(ec == ErrorCode::Success ? ErrorCode::ConnectionReset : ec);
         return;
@@ -180,23 +174,18 @@ void TcpConnection::OnRecvComplete(IoContext* /*ctx*/, DWORD bytes, ErrorCode ec
         m_on_data(m_recv_ctx.inline_buf, bytes);
     }
 
-    if (m_reading) {
+    if (m_reading.load()) {
         PostRecv();
     }
 }
 
 ErrorCode TcpConnection::Send(const uint8_t* data, size_t len) {
-    if (!m_connected) return ErrorCode::ConnectionReset;
+    if (!m_connected.load()) return ErrorCode::ConnectionReset;
 
-    EnterCriticalSection(&m_send_cs);
-
+    std::unique_lock<std::mutex> lock(m_send_mutex);
     m_send_queue.push(ByteBuffer(data, data + len));
-
-    if (!m_send_in_progress) {
-        FlushSendQueue();
-    }
-
-    LeaveCriticalSection(&m_send_cs);
+    if (!m_send_in_progress)
+        FlushSendQueue();  // called with lock held
     return ErrorCode::Success;
 }
 
@@ -232,26 +221,20 @@ void TcpConnection::FlushSendQueue() {
 }
 
 void TcpConnection::OnSendComplete(IoContext* /*ctx*/, DWORD /*bytes*/, ErrorCode ec) {
-    EnterCriticalSection(&m_send_cs);
-
-    if (!m_send_queue.empty()) {
+    std::unique_lock<std::mutex> lock(m_send_mutex);
+    if (!m_send_queue.empty())
         m_send_queue.pop();
-    }
-
     if (ec != ErrorCode::Success) {
         m_send_in_progress = false;
-        LeaveCriticalSection(&m_send_cs);
         return;
     }
-
-    FlushSendQueue();
-    LeaveCriticalSection(&m_send_cs);
+    FlushSendQueue();  // called with lock held
 }
 
 void TcpConnection::Close() {
     m_abort.store(true);
-    m_connected = false;
-    m_reading   = false;
+    m_connected.store(false);
+    m_reading.store(false);
 
     if (m_socket != INVALID_SOCKET) {
         CancelIoEx(reinterpret_cast<HANDLE>(m_socket), nullptr);
@@ -260,8 +243,7 @@ void TcpConnection::Close() {
         m_socket = INVALID_SOCKET;
     }
 
-    EnterCriticalSection(&m_send_cs);
+    std::lock_guard<std::mutex> lock(m_send_mutex);
     while (!m_send_queue.empty()) m_send_queue.pop();
     m_send_in_progress = false;
-    LeaveCriticalSection(&m_send_cs);
 }

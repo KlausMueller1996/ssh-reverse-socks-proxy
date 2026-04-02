@@ -11,6 +11,7 @@ enum class IoOp : uint8_t {
     Send,
     Recv,
     Timer,
+    Work,   // explicitly-posted work item (use instead of repurposing Timer)
 };
 
 // Extends OVERLAPPED — must be allocated for each async operation.
@@ -52,9 +53,6 @@ public:
 
     // Post a manual completion to wake a worker.
     static void PostCompletion(IoContext* ctx, DWORD bytes = 0);
-
-    // Get the IOCP handle (for advanced use).
-    static HANDLE GetHandle();
 
 private:
     static DWORD WINAPI WorkerThread(LPVOID param);

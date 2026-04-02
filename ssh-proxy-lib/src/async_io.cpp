@@ -51,11 +51,22 @@ ErrorCode IoEngine::Init(int thread_count) {
 
     // Start worker threads
     s_thread_count = thread_count;
-    s_threads = new HANDLE[thread_count];
+    s_threads = new HANDLE[thread_count]{};
     for (int i = 0; i < thread_count; ++i) {
         s_threads[i] = CreateThread(nullptr, 0, WorkerThread, nullptr, 0, nullptr);
         if (!s_threads[i]) {
             Logger::Error("CreateThread failed: %lu", GetLastError());
+            // Shut down any workers that were already spawned
+            for (int j = 0; j < i; ++j)
+                PostQueuedCompletionStatus(s_iocp, 0, IOCP_SHUTDOWN_KEY, nullptr);
+            if (i > 0)
+                WaitForMultipleObjects(static_cast<DWORD>(i), s_threads, TRUE, 5000);
+            for (int j = 0; j < i; ++j) CloseHandle(s_threads[j]);
+            delete[] s_threads;
+            s_threads = nullptr;
+            CloseHandle(s_iocp);
+            s_iocp = nullptr;
+            WSACleanup();
             return ErrorCode::SocketError;
         }
     }
@@ -107,10 +118,6 @@ LPFN_CONNECTEX IoEngine::GetConnectEx() {
 
 void IoEngine::PostCompletion(IoContext* ctx, DWORD bytes) {
     PostQueuedCompletionStatus(s_iocp, bytes, 0, ctx);
-}
-
-HANDLE IoEngine::GetHandle() {
-    return s_iocp;
 }
 
 DWORD WINAPI IoEngine::WorkerThread(LPVOID /*param*/) {

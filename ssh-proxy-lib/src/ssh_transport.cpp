@@ -11,11 +11,9 @@ static thread_local bool s_is_io_thread = false;
 
 // ── SshChannel ────────────────────────────────────────────────────────────────
 
-SshChannel::SshChannel(LIBSSH2_CHANNEL* ch, PostWriteFn post_write, PostIoFn post_io, PreCloseFn pre_close)
+SshChannel::SshChannel(LIBSSH2_CHANNEL* ch, ThreadingHooks hooks)
     : m_channel(ch)
-    , m_post_write(std::move(post_write))
-    , m_post_io(std::move(post_io))
-    , m_pre_close(std::move(pre_close))
+    , m_hooks(std::move(hooks))
 {}
 
 ErrorCode SshChannel::Read(uint8_t* buf, size_t len, size_t& bytes_read) {
@@ -44,8 +42,8 @@ ErrorCode SshChannel::Write(const uint8_t* buf, size_t len) {
 
     // If we're NOT on the SSH I/O thread, post via the write queue so libssh2
     // is only touched by the I/O thread.
-    if (m_post_write && !s_is_io_thread) {
-        m_post_write(std::vector<uint8_t>(buf, buf + len));
+    if (m_hooks.post_write && !s_is_io_thread) {
+        m_hooks.post_write(std::vector<uint8_t>(buf, buf + len));
         return ErrorCode::Success;
     }
 
@@ -73,8 +71,8 @@ void SshChannel::SendEof() {
     LIBSSH2_CHANNEL* ch = m_channel.load();
     if (!ch) return;
 
-    if (m_post_io && !s_is_io_thread) {
-        m_post_io([ch]() { libssh2_channel_send_eof(ch); });
+    if (m_hooks.post_io && !s_is_io_thread) {
+        m_hooks.post_io([ch]() { libssh2_channel_send_eof(ch); });
     } else {
         libssh2_channel_send_eof(ch);
     }
@@ -87,14 +85,14 @@ void SshChannel::Close() {
     // Remove from the transport's write queue before freeing.
     // This must happen while ch is still a valid pointer so that
     // DrainWriteQueues cannot call libssh2_channel_write on a freed channel.
-    if (m_pre_close) m_pre_close(ch);
+    if (m_hooks.pre_close) m_hooks.pre_close(ch);
 
     // Always post channel_close/free to io_callbacks — never call directly,
     // even on the IO thread. This guarantees that any io_callbacks already
     // queued for this channel (e.g. a SendEof posted by an IOCP thread just
     // before Close() ran) are drained in FIFO order before channel_free fires.
-    if (m_post_io) {
-        m_post_io([ch]() {
+    if (m_hooks.post_io) {
+        m_hooks.post_io([ch]() {
             libssh2_channel_close(ch);
             libssh2_channel_free(ch);
         });
@@ -218,9 +216,9 @@ Result SshTransport::Connect(const std::string& host, uint16_t port,
     libssh2_session_set_blocking(session.get(), 0);
 
     // ── All resources acquired — commit to members ────────────────────────────
-    m_socket   = sock.release();
-    m_session  = session.release();
-    m_listener = listener.release();
+    m_socket   = std::move(sock);
+    m_session  = std::move(session);
+    m_listener = std::move(listener);
     m_connected.store(true);
     return {};
 }
@@ -244,7 +242,7 @@ void SshTransport::IoThreadProc(OnChannelAccepted on_channel,
 
         // ── Send keepalives ───────────────────────────────────────────────────
         int next_keepalive = 0;
-        libssh2_keepalive_send(m_session, &next_keepalive);
+        libssh2_keepalive_send(m_session.get(), &next_keepalive);
 
         // ── Drain per-channel write queues ────────────────────────────────────
         DrainWriteQueues();
@@ -253,20 +251,22 @@ void SshTransport::IoThreadProc(OnChannelAccepted on_channel,
         PumpSessions();
 
         // ── Accept new channels ───────────────────────────────────────────────
-        LIBSSH2_CHANNEL* ch = libssh2_channel_forward_accept(m_listener);
+        LIBSSH2_CHANNEL* ch = libssh2_channel_forward_accept(m_listener.get());
         if (ch) {
             Logger::Debug("Accepted forwarded-tcpip channel");
 
             // Inject thread-safety callbacks so IOCP threads never call
             // libssh2 directly through SshChannel::Write/SendEof/Close.
-            auto post_write = [this, ch](std::vector<uint8_t> data) {
-                PostChannelWrite(ch, std::move(data));
-            };
-            auto post_io = [this](std::function<void()> fn) {
-                PostToIoThread(std::move(fn));
-            };
-            auto pre_close = [this](LIBSSH2_CHANNEL* c) {
-                RemoveChannelWriteQueue(c);
+            SshChannel::ThreadingHooks hooks{
+                [this, ch](std::vector<uint8_t> data) {
+                    PostChannelWrite(ch, std::move(data));
+                },
+                [this](std::function<void()> fn) {
+                    PostToIoThread(std::move(fn));
+                },
+                [this](LIBSSH2_CHANNEL* c) {
+                    RemoveChannelWriteQueue(c);
+                }
             };
 
             // Register channel in the write queue eagerly so PostChannelWrite
@@ -276,18 +276,18 @@ void SshTransport::IoThreadProc(OnChannelAccepted on_channel,
                 m_write_queues.push_back(ChannelQueue{ ch, {} });
             }
 
-            auto ssh_ch = std::make_unique<SshChannel>(
-                ch, std::move(post_write), std::move(post_io), std::move(pre_close));
-            on_channel(std::move(ssh_ch));
+            auto ssh_ch = std::make_unique<SshChannel>(ch, std::move(hooks));
+            auto pump = on_channel(std::move(ssh_ch));
+            if (pump) RegisterSessionPump(std::move(pump));
             continue;
         }
 
-        int rc = libssh2_session_last_errno(m_session);
+        int rc = libssh2_session_last_errno(m_session.get());
         if (rc == LIBSSH2_ERROR_EAGAIN) {
             // No channel yet — select on socket
             fd_set fds;
             FD_ZERO(&fds);
-            FD_SET(m_socket, &fds);
+            FD_SET(m_socket.get(), &fds);
             struct timeval tv{ 0, 1000 };  // 1 ms — keeps relay latency low while sessions are active
             select(0, &fds, nullptr, nullptr, &tv);
             continue;
@@ -300,7 +300,7 @@ void SshTransport::IoThreadProc(OnChannelAccepted on_channel,
 
         // Unexpected session error
         char* errmsg = nullptr;
-        libssh2_session_last_error(m_session, &errmsg, nullptr, 0);
+        libssh2_session_last_error(m_session.get(), &errmsg, nullptr, 0);
         Logger::Error("SSH session error: %s", errmsg ? errmsg : "unknown");
         disconnect_reason = ErrorCode::ProtocolError;
         break;
@@ -385,20 +385,12 @@ void SshTransport::Close() {
     if (m_io_thread.joinable())
         m_io_thread.join();
 
-    if (m_listener) {
-        libssh2_channel_forward_cancel(m_listener);
-        m_listener = nullptr;
-    }
-    if (m_session) {
-        libssh2_session_set_blocking(m_session, 1);
-        libssh2_session_disconnect(m_session, "Normal shutdown");
-        libssh2_session_free(m_session);
-        m_session = nullptr;
-    }
-    if (m_socket != INVALID_SOCKET) {
-        closesocket(m_socket);
-        m_socket = INVALID_SOCKET;
-    }
+    // RAII destructors handle cleanup in correct order:
+    // m_listener destroyed first (forward_cancel), then m_session (disconnect + free),
+    // then m_socket (closesocket).
+    m_listener.reset();
+    m_session.reset();   // sends SSH_MSG_DISCONNECT if handshake was completed
+    m_socket = WinSocket{};
     m_connected.store(false);
     Logger::Debug("SshTransport closed");
 }

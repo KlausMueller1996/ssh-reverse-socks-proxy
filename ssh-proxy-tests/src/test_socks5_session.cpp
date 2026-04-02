@@ -59,6 +59,7 @@ TEST(Socks5Session, MethodNegotiationAcceptsNoAuth) {
 
     auto session = std::make_shared<Socks5Session>(std::move(ch));
     session->Start();
+    while (session->PumpSshRead()) {}
 
     // Method response: {VER=5, METHOD=0 (AUTH_NONE)}
     ASSERT_GE(raw->written.size(), 2u);
@@ -75,6 +76,7 @@ TEST(Socks5Session, MethodNegotiationRejectsIfNoAuthAbsent) {
 
     auto session = std::make_shared<Socks5Session>(std::move(ch));
     session->Start();
+    while (session->PumpSshRead()) {}
 
     ASSERT_GE(raw->written.size(), 2u);
     EXPECT_EQ(raw->written[0], uint8_t{0x05});
@@ -90,6 +92,7 @@ TEST(Socks5Session, BadSocksVersionClosesSession) {
 
     auto session = std::make_shared<Socks5Session>(std::move(ch));
     session->Start();
+    while (session->PumpSshRead()) {}
 
     ASSERT_GE(raw->written.size(), 2u);
     EXPECT_EQ(raw->written[1], uint8_t{0xFF}); // AUTH_NO_ACCEPTABLE
@@ -108,6 +111,7 @@ TEST(Socks5Session, MalformedConnectRequestSendsFailure) {
 
     auto session = std::make_shared<Socks5Session>(std::move(ch));
     session->Start();
+    while (session->PumpSshRead()) {}
 
     // written = method_response(2) + connect_reply(10)
     ASSERT_GE(raw->written.size(), 4u);
@@ -131,6 +135,7 @@ TEST(Socks5Session, PartialMethodDataWaitsForMore) {
 
     auto session = std::make_shared<Socks5Session>(std::move(ch));
     session->Start();
+    while (session->PumpSshRead()) {}
 
     ASSERT_GE(raw->written.size(), 2u);
     EXPECT_EQ(raw->written[0], uint8_t{0x05});
