@@ -6,15 +6,18 @@ Socks5Session::Socks5Session(std::unique_ptr<IChannel> channel)
     , m_tcp(std::make_shared<TcpConnection>())
 {}
 
-Socks5Session::~Socks5Session() {
+Socks5Session::~Socks5Session()
+{
     Close();
 }
 
-void Socks5Session::Start() {
+void Socks5Session::Start()
+{
     // Full lifecycle (handshake + relay) is driven non-blocking by PumpSshRead().
 }
 
-void Socks5Session::OnChannelData(const uint8_t* data, size_t len) {
+void Socks5Session::OnChannelData(const uint8_t* data, size_t len)
+{
     m_inbound_buf.insert(m_inbound_buf.end(), data, data + len);
 
     switch (m_state.load()) {
@@ -29,13 +32,15 @@ void Socks5Session::OnChannelData(const uint8_t* data, size_t len) {
     }
 }
 
-void Socks5Session::HandleMethodNegotiation(const uint8_t* data, size_t len) {
+void Socks5Session::HandleMethodNegotiation(const uint8_t* data, size_t len)
+{
     bool supports_no_auth = false;
     int consumed = Socks5::ParseMethodRequest(data, len, supports_no_auth);
 
     if (consumed == 0) return;  // need more data; PumpSshRead delivers next iteration
 
-    if (consumed < 0 || !supports_no_auth) {
+    if (consumed < 0 || !supports_no_auth)
+    {
         Logger::Warn("SOCKS5: method negotiation failed (no-auth not offered)");
         auto reply = Socks5::BuildMethodResponse(Socks5::AUTH_NO_ACCEPTABLE);
         m_channel->Write(reply.data(), reply.size());
@@ -54,13 +59,15 @@ void Socks5Session::HandleMethodNegotiation(const uint8_t* data, size_t len) {
         HandleConnectRequest(m_inbound_buf.data(), m_inbound_buf.size());
 }
 
-void Socks5Session::HandleConnectRequest(const uint8_t* data, size_t len) {
+void Socks5Session::HandleConnectRequest(const uint8_t* data, size_t len)
+{
     Socks5::ConnectRequest req{};
     int consumed = Socks5::ParseConnectRequest(data, len, req);
 
     if (consumed == 0) return;  // need more data; PumpSshRead delivers next iteration
 
-    if (consumed < 0) {
+    if (consumed < 0)
+    {
         Logger::Warn("SOCKS5: malformed connect request");
         auto reply = Socks5::BuildConnectReply(Socks5::REP_GENERAL_FAILURE);
         m_channel->Write(reply.data(), reply.size());
@@ -75,24 +82,28 @@ void Socks5Session::HandleConnectRequest(const uint8_t* data, size_t len) {
     StartTcpConnect(req);
 }
 
-void Socks5Session::StartTcpConnect(const Socks5::ConnectRequest& req) {
+void Socks5Session::StartTcpConnect(const Socks5::ConnectRequest& req)
+{
     m_state.store(State::Connecting);
 
     // Use weak_ptr: TcpConnection must not hold a strong ref back to the session
     // (session owns m_tcp, so that would be a cycle).
     std::weak_ptr<Socks5Session> weak = weak_from_this();
     m_tcp->ConnectAsync(req.host, req.port,
-        [weak](ErrorCode connect_ec) {
+        [weak](ErrorCode connect_ec)
+        {
             if (auto self = weak.lock()) self->OnTcpConnected(connect_ec);
         });
     // Errors (DNS failure, socket error) now arrive via the callback above.
 }
 
-void Socks5Session::OnTcpConnected(ErrorCode ec) {
+void Socks5Session::OnTcpConnected(ErrorCode ec)
+{
     // This fires on an IOCP worker thread. All m_channel calls go through
     // the post_write / post_io queues and are safe to call here.
 
-    if (ec != ErrorCode::Success) {
+    if (ec != ErrorCode::Success)
+    {
         Logger::Warn("SOCKS5: target TCP connect failed: %s", ErrorCodeToString(ec));
         auto reply = Socks5::BuildConnectReply(Socks5::ErrorCodeToSocks5Reply(ec));
         m_channel->Write(reply.data(), reply.size());
@@ -108,7 +119,8 @@ void Socks5Session::OnTcpConnected(ErrorCode ec) {
     StartRelay();
 }
 
-void Socks5Session::StartRelay() {
+void Socks5Session::StartRelay()
+{
     // Called from an IOCP thread. Set up the TCP→SSH direction only.
     // The SSH→TCP direction is handled by PumpSshRead(), called by the SSH I/O thread.
 
@@ -117,18 +129,22 @@ void Socks5Session::StartRelay() {
     std::weak_ptr<Socks5Session> weak = weak_from_this();
 
     m_tcp->StartReading(
-        [weak](const uint8_t* data, size_t len) {
+        [weak](const uint8_t* data, size_t len)
+        {
             if (auto self = weak.lock()) self->m_channel->Write(data, len);
         },
-        [weak](ErrorCode) {
-            if (auto self = weak.lock()) {
+        [weak](ErrorCode)
+        {
+            if (auto self = weak.lock())
+            {
                 self->m_channel->SendEof();
                 self->Close();
             }
         });
 }
 
-bool Socks5Session::PumpSshRead() {
+bool Socks5Session::PumpSshRead()
+{
     // Called on the SSH I/O thread every loop iteration.
     // Drives all states: ReadingMethods, ReadingRequest, Relaying.
 
@@ -142,28 +158,34 @@ bool Socks5Session::PumpSshRead() {
 
     if (ec == ErrorCode::WouldBlock) return true;  // no data yet, try next iteration
 
-    if (ec != ErrorCode::Success || bytes_read == 0) {
+    if (ec != ErrorCode::Success || bytes_read == 0)
+    {
         Close();
         return false;
     }
 
-    if (s == State::Relaying) {
+    if (s == State::Relaying)
+    {
         m_tcp->Send(buf, bytes_read);
-    } else {
+    }
+    else
+    {
         OnChannelData(buf, bytes_read);
     }
 
     return m_state.load() != State::Closed;
 }
 
-void Socks5Session::Close() {
+void Socks5Session::Close()
+{
     // Atomic exchange ensures Close runs exactly once even if called from both
     // the IOCP thread (TCP close callback) and the SSH I/O thread (PumpSshRead).
     State prev = m_state.exchange(State::Closed);
     if (prev == State::Closed) return;
 
     m_tcp->Close();
-    if (m_channel) {
+    if (m_channel)
+    {
         m_channel->SendEof();
         m_channel->Close();
     }

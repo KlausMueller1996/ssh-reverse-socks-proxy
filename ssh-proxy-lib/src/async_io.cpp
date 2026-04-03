@@ -7,44 +7,50 @@ int             IoEngine::s_thread_count = 0;
 LPFN_CONNECTEX  IoEngine::s_connect_ex = nullptr;
 bool            IoEngine::s_initialized = false;
 
-ErrorCode IoEngine::Init(int thread_count) {
+ErrorCode IoEngine::Init(int thread_count)
+{
     if (s_initialized)
         return ErrorCode::Success;
 
     // Initialize Winsock
     WSADATA wsa;
-    if (WSAStartup(MAKEWORD(2, 2), &wsa) != 0) {
-        Logger::Error("WSAStartup failed: %d", WSAGetLastError());
+    if (::WSAStartup(MAKEWORD(2, 2), &wsa) != 0)
+    {
+        Logger::Error("WSAStartup failed: %d", ::WSAGetLastError());
         return ErrorCode::SocketError;
     }
 
     // Determine thread count
-    if (thread_count <= 0) {
+    if (thread_count <= 0)
+    {
         SYSTEM_INFO si;
-        GetSystemInfo(&si);
+        ::GetSystemInfo(&si);
         thread_count = static_cast<int>(si.dwNumberOfProcessors);
         if (thread_count < 1) thread_count = 1;
     }
 
     // Create completion port
-    s_iocp = CreateIoCompletionPort(INVALID_HANDLE_VALUE, nullptr, 0, static_cast<DWORD>(thread_count));
-    if (!s_iocp) {
-        Logger::Error("CreateIoCompletionPort failed: %lu", GetLastError());
+    s_iocp = ::CreateIoCompletionPort(INVALID_HANDLE_VALUE, nullptr, 0, static_cast<DWORD>(thread_count));
+    if (s_iocp == nullptr)
+    {
+        Logger::Error("CreateIoCompletionPort failed: %lu", ::GetLastError());
         return ErrorCode::SocketError;
     }
 
     // Load ConnectEx
-    SOCKET tmp = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
-    if (tmp != INVALID_SOCKET) {
+    SOCKET tmp = ::socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+    if (tmp != INVALID_SOCKET)
+    {
         GUID guid = WSAID_CONNECTEX;
         DWORD bytes = 0;
-        WSAIoctl(tmp, SIO_GET_EXTENSION_FUNCTION_POINTER,
-                 &guid, sizeof(guid),
-                 &s_connect_ex, sizeof(s_connect_ex),
-                 &bytes, nullptr, nullptr);
-        closesocket(tmp);
+        ::WSAIoctl(tmp, SIO_GET_EXTENSION_FUNCTION_POINTER,
+                   &guid, sizeof(guid),
+                   &s_connect_ex, sizeof(s_connect_ex),
+                   &bytes, nullptr, nullptr);
+        ::closesocket(tmp);
     }
-    if (!s_connect_ex) {
+    if (s_connect_ex == nullptr)
+    {
         Logger::Error("Failed to load ConnectEx");
         return ErrorCode::SocketError;
     }
@@ -52,21 +58,23 @@ ErrorCode IoEngine::Init(int thread_count) {
     // Start worker threads
     s_thread_count = thread_count;
     s_threads = new HANDLE[thread_count]{};
-    for (int i = 0; i < thread_count; ++i) {
-        s_threads[i] = CreateThread(nullptr, 0, WorkerThread, nullptr, 0, nullptr);
-        if (!s_threads[i]) {
-            Logger::Error("CreateThread failed: %lu", GetLastError());
+    for (int i = 0; i < thread_count; ++i)
+    {
+        s_threads[i] = ::CreateThread(nullptr, 0, WorkerThread, nullptr, 0, nullptr);
+        if (s_threads[i] == nullptr)
+        {
+            Logger::Error("CreateThread failed: %lu", ::GetLastError());
             // Shut down any workers that were already spawned
             for (int j = 0; j < i; ++j)
-                PostQueuedCompletionStatus(s_iocp, 0, IOCP_SHUTDOWN_KEY, nullptr);
+                ::PostQueuedCompletionStatus(s_iocp, 0, IOCP_SHUTDOWN_KEY, nullptr);
             if (i > 0)
-                WaitForMultipleObjects(static_cast<DWORD>(i), s_threads, TRUE, 5000);
-            for (int j = 0; j < i; ++j) CloseHandle(s_threads[j]);
+                ::WaitForMultipleObjects(static_cast<DWORD>(i), s_threads, TRUE, 5000);
+            for (int j = 0; j < i; ++j) ::CloseHandle(s_threads[j]);
             delete[] s_threads;
             s_threads = nullptr;
-            CloseHandle(s_iocp);
+            ::CloseHandle(s_iocp);
             s_iocp = nullptr;
-            WSACleanup();
+            ::WSACleanup();
             return ErrorCode::SocketError;
         }
     }
@@ -76,68 +84,79 @@ ErrorCode IoEngine::Init(int thread_count) {
     return ErrorCode::Success;
 }
 
-void IoEngine::Shutdown() {
+void IoEngine::Shutdown()
+{
     if (!s_initialized)
         return;
 
     // Signal all workers to exit
-    for (int i = 0; i < s_thread_count; ++i) {
-        PostQueuedCompletionStatus(s_iocp, 0, IOCP_SHUTDOWN_KEY, nullptr);
+    for (int i = 0; i < s_thread_count; ++i)
+    {
+        ::PostQueuedCompletionStatus(s_iocp, 0, IOCP_SHUTDOWN_KEY, nullptr);
     }
 
     // Wait for all workers
-    WaitForMultipleObjects(static_cast<DWORD>(s_thread_count), s_threads, TRUE, 5000);
+    ::WaitForMultipleObjects(static_cast<DWORD>(s_thread_count), s_threads, TRUE, 5000);
 
-    for (int i = 0; i < s_thread_count; ++i) {
-        CloseHandle(s_threads[i]);
+    for (int i = 0; i < s_thread_count; ++i)
+    {
+        ::CloseHandle(s_threads[i]);
     }
     delete[] s_threads;
     s_threads = nullptr;
 
-    CloseHandle(s_iocp);
+    ::CloseHandle(s_iocp);
     s_iocp = nullptr;
 
-    WSACleanup();
+    ::WSACleanup();
     s_initialized = false;
 
     Logger::Info("IoEngine shut down");
 }
 
-ErrorCode IoEngine::Associate(SOCKET sock, ULONG_PTR key) {
-    HANDLE h = CreateIoCompletionPort(reinterpret_cast<HANDLE>(sock), s_iocp, key, 0);
-    if (!h) {
-        Logger::Error("Associate socket to IOCP failed: %lu", GetLastError());
+ErrorCode IoEngine::Associate(SOCKET sock, ULONG_PTR key)
+{
+    HANDLE h = ::CreateIoCompletionPort(reinterpret_cast<HANDLE>(sock), s_iocp, key, 0);
+    if (h == nullptr)
+    {
+        Logger::Error("Associate socket to IOCP failed: %lu", ::GetLastError());
         return ErrorCode::SocketError;
     }
     return ErrorCode::Success;
 }
 
-LPFN_CONNECTEX IoEngine::GetConnectEx() {
+LPFN_CONNECTEX IoEngine::GetConnectEx()
+{
     return s_connect_ex;
 }
 
-void IoEngine::PostCompletion(IoContext* ctx, DWORD bytes) {
-    PostQueuedCompletionStatus(s_iocp, bytes, 0, ctx);
+void IoEngine::PostCompletion(IoContext* ctx, DWORD bytes)
+{
+    ::PostQueuedCompletionStatus(s_iocp, bytes, 0, ctx);
 }
 
-DWORD WINAPI IoEngine::WorkerThread(LPVOID /*param*/) {
+DWORD WINAPI IoEngine::WorkerThread(LPVOID /*param*/)
+{
     Logger::Debug("IOCP worker thread started");
 
-    for (;;) {
+    for (;;)
+    {
         DWORD bytes_transferred = 0;
         ULONG_PTR completion_key = 0;
         LPOVERLAPPED overlapped = nullptr;
 
-        BOOL ok = GetQueuedCompletionStatus(
+        BOOL ok = ::GetQueuedCompletionStatus(
             s_iocp, &bytes_transferred, &completion_key, &overlapped, INFINITE);
 
         // Shutdown signal
-        if (completion_key == IOCP_SHUTDOWN_KEY) {
+        if (completion_key == IOCP_SHUTDOWN_KEY)
+        {
             Logger::Debug("IOCP worker thread shutting down");
             break;
         }
 
-        if (!overlapped) {
+        if (overlapped == nullptr)
+        {
             // Spurious wake or error with no overlapped
             continue;
         }
@@ -145,19 +164,24 @@ DWORD WINAPI IoEngine::WorkerThread(LPVOID /*param*/) {
         auto* ctx = static_cast<IoContext*>(overlapped);
 
         ErrorCode ec = ErrorCode::Success;
-        if (!ok) {
-            DWORD err = GetLastError();
-            if (err == ERROR_OPERATION_ABORTED) {
+        if (!ok)
+        {
+            DWORD err = ::GetLastError();
+            if (err == ERROR_OPERATION_ABORTED)
+            {
                 // Cancelled — socket was closed
                 ec = ErrorCode::Shutdown;
-            } else {
+            }
+            else
+            {
                 ec = WsaToErrorCode(static_cast<int>(err));
                 if (ec == ErrorCode::Success)
                     ec = ErrorCode::SocketError;
             }
         }
 
-        if (ctx->callback) {
+        if (ctx->callback)
+        {
             // Move out before calling: releases any shared_ptr captured in the
             // callback immediately after the call, breaking self-reference cycles
             // (e.g. IoContext callback → shared_ptr<TcpConnection> → IoContext).

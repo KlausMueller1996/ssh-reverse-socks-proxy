@@ -10,43 +10,54 @@ std::deque<LogEntry>  Logger::s_buffer;
 ssh_proxy::LogLevel   Logger::s_min_level = ssh_proxy::LogLevel::Info;
 Logger::LogCallback   Logger::s_callback;
 
-void Logger::SetMinLevel(ssh_proxy::LogLevel level) {
+void Logger::SetMinLevel(ssh_proxy::LogLevel level)
+{
     std::lock_guard<std::mutex> lock(s_mutex);
     s_min_level = level;
 }
 
-void Logger::SetCallback(LogCallback cb) {
+void Logger::SetCallback(LogCallback cb)
+{
     std::lock_guard<std::mutex> lock(s_mutex);
     s_callback = std::move(cb);
 }
 
-std::vector<LogEntry> Logger::Snapshot() {
+std::vector<LogEntry> Logger::Snapshot()
+{
     std::lock_guard<std::mutex> lock(s_mutex);
     return std::vector<LogEntry>(s_buffer.begin(), s_buffer.end());
 }
 
-void Logger::Debug(const char* fmt, ...) {
+void Logger::Debug(const char* fmt, ...)
+{
     va_list args; va_start(args, fmt);
     Log(ssh_proxy::LogLevel::Debug, fmt, args);
     va_end(args);
 }
-void Logger::Info(const char* fmt, ...) {
+
+void Logger::Info(const char* fmt, ...)
+{
     va_list args; va_start(args, fmt);
     Log(ssh_proxy::LogLevel::Info, fmt, args);
     va_end(args);
 }
-void Logger::Warn(const char* fmt, ...) {
+
+void Logger::Warn(const char* fmt, ...)
+{
     va_list args; va_start(args, fmt);
     Log(ssh_proxy::LogLevel::Warn, fmt, args);
     va_end(args);
 }
-void Logger::Error(const char* fmt, ...) {
+
+void Logger::Error(const char* fmt, ...)
+{
     va_list args; va_start(args, fmt);
     Log(ssh_proxy::LogLevel::Error, fmt, args);
     va_end(args);
 }
 
-void Logger::Log(ssh_proxy::LogLevel level, const char* fmt, va_list args) {
+void Logger::Log(ssh_proxy::LogLevel level, const char* fmt, va_list args)
+{
     // Check level before formatting
     {
         std::lock_guard<std::mutex> lock(s_mutex);
@@ -56,13 +67,13 @@ void Logger::Log(ssh_proxy::LogLevel level, const char* fmt, va_list args) {
 
     // Format message
     char msg_buf[1024];
-    vsnprintf(msg_buf, sizeof(msg_buf), fmt, args);
+    ::vsnprintf(msg_buf, sizeof(msg_buf), fmt, args);
 
     // Build timestamp
     SYSTEMTIME st;
-    GetLocalTime(&st);
+    ::GetLocalTime(&st);
     char ts_buf[32];
-    snprintf(ts_buf, sizeof(ts_buf), "%04u-%02u-%02u %02u:%02u:%02u.%03u",
+    ::snprintf(ts_buf, sizeof(ts_buf), "%04u-%02u-%02u %02u:%02u:%02u.%03u",
         st.wYear, st.wMonth, st.wDay,
         st.wHour, st.wMinute, st.wSecond, st.wMilliseconds);
 
@@ -88,13 +99,15 @@ void Logger::Log(ssh_proxy::LogLevel level, const char* fmt, va_list args) {
 
 namespace ssh_proxy {
 
-std::string GetLog() {
+std::string GetLog()
+{
     static const char* level_tags[] = { "DEBUG", "INFO ", "WARN ", "ERROR" };
 
     auto entries = Logger::Snapshot();
     std::string out;
     out.reserve(entries.size() * 80);
-    for (const auto& e : entries) {
+    for (const auto& e : entries)
+    {
         int idx = static_cast<int>(e.level);
         if (idx < 0 || idx > 3) idx = 3;
         out += e.timestamp;

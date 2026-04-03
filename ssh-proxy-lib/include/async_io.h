@@ -26,8 +26,9 @@ struct IoContext : OVERLAPPED {
     // Callback: (IoContext*, DWORD bytes_transferred, ErrorCode)
     std::function<void(IoContext*, DWORD, ErrorCode)> callback;
 
-    IoContext() {
-        ZeroMemory(static_cast<OVERLAPPED*>(this), sizeof(OVERLAPPED));
+    IoContext()
+    {
+        ::ZeroMemory(static_cast<OVERLAPPED*>(this), sizeof(OVERLAPPED));
         op = IoOp::Recv;
         socket = INVALID_SOCKET;
         wsa_buf.buf = reinterpret_cast<char*>(inline_buf);

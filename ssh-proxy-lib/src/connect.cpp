@@ -55,7 +55,7 @@ namespace ssh_proxy {
             throw std::runtime_error(std::string("IoEngine init failed: ") + ErrorCodeToString(ec));
 
         // Initialize libssh2 (idempotent)
-        if (libssh2_init(0) != 0)
+        if (::libssh2_init(0) != 0)
             throw std::runtime_error("libssh2_init failed");
 
         const auto& cfg = guard->config;
@@ -79,14 +79,17 @@ namespace ssh_proxy {
         // on_channel returns a pump function that the transport auto-registers.
         Impl* impl = guard.get();
         impl->transport.StartAccepting(
-            [impl](std::unique_ptr<SshChannel> ch) -> SshTransport::SessionPumpFn {
+            [impl](std::unique_ptr<SshChannel> ch) -> SshTransport::SessionPumpFn
+            {
                 auto session = std::make_shared<Socks5Session>(std::move(ch));
                 session->Start();
-                return [session]() -> bool {
+                return [session]() -> bool
+                {
                     return session->PumpSshRead();
                 };
             },
-            [impl](ErrorCode reason) {
+            [impl](ErrorCode reason)
+            {
                 Logger::Warn("SSH session disconnected: %s", ErrorCodeToString(reason));
                 impl->connected.store(false);
             });
@@ -112,7 +115,7 @@ namespace ssh_proxy {
 
     bool Connect::IsConnected() const
     {
-        return m_impl && m_impl->connected.load();
+        return m_impl != nullptr && m_impl->connected.load();
     }
 
 } // namespace ssh_proxy

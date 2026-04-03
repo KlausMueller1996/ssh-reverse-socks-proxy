@@ -55,7 +55,8 @@ enum class ErrorCode : int {
     WouldBlock,
 };
 
-inline const char* ErrorCodeToString(ErrorCode ec) {
+inline const char* ErrorCodeToString(ErrorCode ec)
+{
     switch (ec) {
     case ErrorCode::Success:                      return "Success";
     case ErrorCode::InvalidArgument:              return "InvalidArgument";
@@ -84,7 +85,8 @@ inline const char* ErrorCodeToString(ErrorCode ec) {
 }
 
 // Convert a WinSock error to ErrorCode
-inline ErrorCode WsaToErrorCode(int wsa_error) {
+inline ErrorCode WsaToErrorCode(int wsa_error)
+{
     switch (wsa_error) {
     case 0:              return ErrorCode::Success;
     case WSAECONNRESET:  return ErrorCode::ConnectionReset;
@@ -111,7 +113,8 @@ struct Result {
     bool ok() const { return code == ErrorCode::Success; }
 
     // Returns the diagnostic message if one was set, otherwise the enum name.
-    const char* what() const {
+    const char* what() const
+    {
         return message.empty() ? ErrorCodeToString(code) : message.c_str();
     }
 };
@@ -129,20 +132,22 @@ struct Result {
 // succeeds, so that subsequent cleanup sends a clean SSH_MSG_DISCONNECT.
 struct SshSessionDeleter {
     bool send_disconnect = false;
-    void operator()(LIBSSH2_SESSION* s) const {
-        libssh2_session_set_blocking(s, 1);
+    void operator()(LIBSSH2_SESSION* s) const
+    {
+        ::libssh2_session_set_blocking(s, 1);
         if (send_disconnect)
-            libssh2_session_disconnect(s, "Shutdown");
-        libssh2_session_free(s);
+            ::libssh2_session_disconnect(s, "Shutdown");
+        ::libssh2_session_free(s);
     }
 };
 using SshSessionPtr = std::unique_ptr<LIBSSH2_SESSION, SshSessionDeleter>;
 
 // LIBSSH2_CHANNEL* — close → free.
 struct SshChannelDeleter {
-    void operator()(LIBSSH2_CHANNEL* c) const {
-        libssh2_channel_close(c);
-        libssh2_channel_free(c);
+    void operator()(LIBSSH2_CHANNEL* c) const
+    {
+        ::libssh2_channel_close(c);
+        ::libssh2_channel_free(c);
     }
 };
 using SshChannelPtr = std::unique_ptr<LIBSSH2_CHANNEL, SshChannelDeleter>;
@@ -152,8 +157,9 @@ using SshChannelPtr = std::unique_ptr<LIBSSH2_CHANNEL, SshChannelDeleter>;
 // Declare SshListenerPtr *after* SshSessionPtr in any local scope so that
 // C++ destroys it first (reverse declaration order), before the session.
 struct SshListenerDeleter {
-    void operator()(LIBSSH2_LISTENER* l) const {
-        libssh2_channel_forward_cancel(l);
+    void operator()(LIBSSH2_LISTENER* l) const
+    {
+        ::libssh2_channel_forward_cancel(l);
     }
 };
 using SshListenerPtr = std::unique_ptr<LIBSSH2_LISTENER, SshListenerDeleter>;
@@ -165,10 +171,23 @@ struct WinSocket {
 
     WinSocket() = default;
     explicit WinSocket(SOCKET sock) : s(sock) {}
-    ~WinSocket()                               { close(); }
-    WinSocket(WinSocket&& o) noexcept          : s(o.s) { o.s = INVALID_SOCKET; }
-    WinSocket& operator=(WinSocket&& o) noexcept {
-        if (this != &o) { close(); s = o.s; o.s = INVALID_SOCKET; }
+    ~WinSocket()
+    {
+        close();
+    }
+    WinSocket(WinSocket&& o) noexcept
+        : s(o.s)
+    {
+        o.s = INVALID_SOCKET;
+    }
+    WinSocket& operator=(WinSocket&& o) noexcept
+    {
+        if (this != &o)
+        {
+            close();
+            s = o.s;
+            o.s = INVALID_SOCKET;
+        }
         return *this;
     }
     WinSocket(const WinSocket&)            = delete;
@@ -179,12 +198,21 @@ struct WinSocket {
     explicit operator bool() const { return s != INVALID_SOCKET; }
 
 private:
-    void close() { if (s != INVALID_SOCKET) { closesocket(s); s = INVALID_SOCKET; } }
+    void close()
+    {
+        if (s != INVALID_SOCKET)
+        {
+            ::closesocket(s);
+            s = INVALID_SOCKET;
+        }
+    }
 };
 
 // addrinfo* — freeaddrinfo.
 struct AddrInfoDeleter {
-    void operator()(addrinfo* ai) const { freeaddrinfo(ai); }
+    void operator()(addrinfo* ai) const
+    {
+        ::freeaddrinfo(ai);
+    }
 };
 using AddrInfoPtr = std::unique_ptr<addrinfo, AddrInfoDeleter>;
-

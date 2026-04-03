@@ -93,7 +93,7 @@ namespace ssh_tunnel {
             ::setsockopt(sock.get(), SOL_SOCKET, SO_SNDTIMEO, reinterpret_cast<const char*>(&tv_ms), sizeof(tv_ms));
 
             if (::connect(sock.get(), addr->ai_addr, static_cast<int>(addr->ai_addrlen)) != 0)
-                throw std::runtime_error("TCP connect to " + host + " failed: " + std::to_string(::WSAGetLastError()));
+                throw std::runtime_error("TCP connect to " + host + ":" + std::to_string(port) + " failed (WSA " + std::to_string(::WSAGetLastError()) + ")");
 
             return sock;
         }

@@ -18,7 +18,8 @@ struct ConnectionConfig {
 
     // Validate fields that would cause silent failures later.
     // Throws std::runtime_error with a descriptive message on bad input.
-    void validate() const {
+    void validate() const
+    {
         if (server_host.empty())
             throw std::runtime_error("server_host must not be empty");
         if (server_port == 0)
