@@ -1,3 +1,22 @@
+//////////////////////////////////////////////////////////////////////////////
+//
+// Logger — thread-safe circular log buffer with optional live callback
+//
+// PURPOSE
+//   Process-wide structured logging at four levels (Debug, Info, Warn, Error).
+//   Entries accumulate in a fixed-size deque (k_max_entries = 100); the oldest
+//   entry is evicted when the buffer is full.  ssh_proxy::GetLog() formats
+//   the current snapshot as a newline-separated string for public API callers.
+//
+// LOCKING
+//   A single s_mutex protects s_buffer, s_min_level, and s_callback.
+//   Log() checks the level under the lock first, then formats the message
+//   outside it (vsnprintf can be slow).  The live callback is copied under
+//   the lock and invoked outside to prevent re-entrancy deadlocks if the
+//   callback itself calls Logger methods.
+//
+//////////////////////////////////////////////////////////////////////////////
+
 #include "logger.h"
 #include <cstdarg>
 #include <cstdio>
@@ -55,6 +74,15 @@ void Logger::Error(const char* fmt, ...)
     Log(ssh_proxy::LogLevel::Error, fmt, args);
     va_end(args);
 }
+
+//
+// ── Log ───────────────────────────────────────────────────────────────────────
+//
+// Internal implementation called by all public level helpers.  Checks the
+// minimum level under the lock before doing any formatting to avoid the cost
+// of vsnprintf for suppressed messages.  The callback is invoked after the
+// lock is released — see LOCKING note in the file header.
+//
 
 void Logger::Log(ssh_proxy::LogLevel level, const char* fmt, va_list args)
 {

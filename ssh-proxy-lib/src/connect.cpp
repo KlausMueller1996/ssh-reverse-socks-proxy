@@ -1,3 +1,24 @@
+//////////////////////////////////////////////////////////////////////////////
+//
+// Connect — public API RAII handle (namespace ssh_proxy)
+//
+// PURPOSE
+//   Entry point for library callers.  Sequences: config validation, IoEngine
+//   and libssh2 init, blocking SshTransport::Connect (TCP + SSH handshake +
+//   auth + remote port-forward request), then starts the SSH I/O thread.
+//
+//   The constructor throws std::runtime_error on any failure — there are no
+//   zombie Connect objects.  The destructor joins the I/O thread by calling
+//   transport.Close() before deleting Impl.
+//
+// SESSION FACTORY
+//   The on_channel lambda passed to StartAccepting bridges SshTransport and
+//   Socks5Session: it constructs a session for each accepted forwarded-tcpip
+//   channel and returns its PumpSshRead bound as a SessionPumpFn.  The SSH
+//   I/O thread calls that pump each loop iteration to drain SSH→TCP data.
+//
+//////////////////////////////////////////////////////////////////////////////
+
 #include "../public/ssh_proxy.h"
 #include "ssh_transport.h"
 #include "socks5_session.h"
@@ -21,7 +42,21 @@ namespace ssh_proxy {
         Impl() = default;
     };
 
-    // ── Connect ───────────────────────────────────────────────────────────────────
+    //////////////////////////////////////////////////////////////////////////////
+    //
+    // Constructor
+    //
+    // Uses a unique_ptr<Impl> guard throughout setup so that any exception
+    // between allocation and the final guard.release() automatically destroys
+    // all resources without per-branch cleanup.
+    //
+    //   Step 1  Validate config (throws on bad input before any I/O)
+    //   Step 2  IoEngine::Init — Winsock, IOCP, worker threads (idempotent)
+    //   Step 3  libssh2_init (idempotent)
+    //   Step 4  SshTransport::Connect — TCP + handshake + auth + port-forward
+    //   Step 5  StartAccepting — launches SSH I/O thread, registers session factory
+    //
+    //////////////////////////////////////////////////////////////////////////////
 
     Connect::Connect(
         std::string  server_host,

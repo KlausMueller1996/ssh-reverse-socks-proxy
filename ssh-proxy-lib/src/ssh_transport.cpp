@@ -1,3 +1,36 @@
+//////////////////////////////////////////////////////////////////////////////
+//
+// SshTransport — SSH I/O thread, libssh2 session owner, channel multiplexer
+//
+// PURPOSE
+//   Manages the full SSH connection lifecycle: blocking setup on the caller's
+//   thread (TCP connect + handshake + auth + tcpip-forward listen), then a
+//   dedicated I/O thread that accepts forwarded channels, drains write queues,
+//   runs keepalives, and pumps active SOCKS5 sessions.
+//
+// THREADING MODEL
+//   Connect() runs synchronously on the caller.  After StartAccepting()
+//   launches IoThreadProc, ALL libssh2 calls are confined to that thread.
+//   s_is_io_thread (thread_local) lets SshChannel methods detect their
+//   calling context at runtime to choose direct call vs. queue dispatch.
+//
+// CROSS-THREAD QUEUES
+//   m_write_queues  — IOCP threads post channel data via PostChannelWrite().
+//                     DrainWriteQueues() flushes them on each I/O loop tick.
+//   m_io_callbacks  — IOCP threads post arbitrary lambdas via PostToIoThread()
+//                     (e.g. SendEof, channel_close/free).  DrainIoCallbacks()
+//                     swaps the vector under lock, then invokes outside lock so
+//                     callbacks cannot deadlock on m_io_callbacks_mutex.
+//
+// CHANNEL WRITE QUEUE LIFECYCLE
+//   A ChannelQueue entry is registered eagerly at accept time, before
+//   on_channel() is called, so PostChannelWrite never races the first Write().
+//   RemoveChannelWriteQueue() (via the pre_close hook) removes the entry
+//   before channel_free fires.  PostChannelWrite discards silently if the
+//   entry is already gone — the channel pointer may be freed.
+//
+//////////////////////////////////////////////////////////////////////////////
+
 #include "ssh_transport.h"
 #include "logger.h"
 #include <algorithm>
@@ -15,6 +48,14 @@ SshChannel::SshChannel(LIBSSH2_CHANNEL* ch, ThreadingHooks hooks)
     : m_channel(ch)
     , m_hooks(std::move(hooks))
 {}
+
+//
+// ── SshChannel::Read ──────────────────────────────────────────────────────────
+//
+// Called on the SSH I/O thread only (libssh2 is not thread-safe).
+// Translates libssh2 return codes to ErrorCode: WouldBlock on EAGAIN,
+// ChannelClosed on EOF or zero bytes, ProtocolError on any other negative.
+//
 
 ErrorCode SshChannel::Read(uint8_t* buf, size_t len, size_t& bytes_read)
 {
@@ -75,6 +116,14 @@ ErrorCode SshChannel::Write(const uint8_t* buf, size_t len)
     }
     return ErrorCode::Success;
 }
+
+//
+// ── SshChannel::SendEof ───────────────────────────────────────────────────────
+//
+// Sends SSH_MSG_CHANNEL_EOF to signal the end of our outbound data stream.
+// If called from outside the I/O thread the call is posted via post_io so
+// libssh2 is only touched by the I/O thread.
+//
 
 void SshChannel::SendEof()
 {
@@ -250,12 +299,42 @@ Result SshTransport::Connect(const std::string& host, uint16_t port,
     return {};
 }
 
+//
+// ── StartAccepting ────────────────────────────────────────────────────────────
+//
+// Launches the SSH I/O thread.  on_channel is called for each accepted
+// forwarded-tcpip channel and must return a SessionPumpFn that the I/O thread
+// calls every loop iteration.  on_disconnect is called when the loop exits.
+//
+
 void SshTransport::StartAccepting(OnChannelAccepted on_channel,
                                    OnDisconnected on_disconnect)
 {
     m_io_thread = std::thread(&SshTransport::IoThreadProc, this,
                               std::move(on_channel), std::move(on_disconnect));
 }
+
+//////////////////////////////////////////////////////////////////////////////
+//
+// IoThreadProc
+//
+// Main SSH I/O loop.  Each iteration:
+//   1. DrainIoCallbacks  — flush lambdas posted by IOCP threads (SendEof,
+//                          channel_close/free) before touching libssh2.
+//   2. keepalive_send    — sends SSH keepalive if the interval has elapsed.
+//   3. DrainWriteQueues  — flushes buffered channel writes from IOCP threads.
+//   4. PumpSessions      — calls each active session's SSH→TCP pump.
+//   5. forward_accept    — accepts the next inbound forwarded-tcpip channel.
+//
+// When no channel is ready, select() blocks for at most 1 ms.  The short
+// timeout keeps relay latency low for active sessions without busy-waiting
+// when the tunnel is idle.
+//
+// LIBSSH2 THREAD SAFETY
+//   s_is_io_thread is set to true for this thread's lifetime.  SshChannel
+//   methods use it to determine whether to call libssh2 directly or queue.
+//
+//////////////////////////////////////////////////////////////////////////////
 
 void SshTransport::IoThreadProc(OnChannelAccepted on_channel,
                                  OnDisconnected on_disconnect)
@@ -349,6 +428,15 @@ void SshTransport::IoThreadProc(OnChannelAccepted on_channel,
         on_disconnect(disconnect_reason);
 }
 
+//
+// ── DrainWriteQueues ──────────────────────────────────────────────────────────
+//
+// Called on the SSH I/O thread.  For each channel that has pending write data
+// (posted by IOCP threads via PostChannelWrite), calls libssh2_channel_write
+// until the queue is empty or EAGAIN stalls the session.  A partial write
+// shrinks the front buffer in place rather than re-queuing.
+//
+
 void SshTransport::DrainWriteQueues()
 {
     std::lock_guard<std::mutex> lock(m_queues_mutex);
@@ -375,6 +463,14 @@ void SshTransport::DrainWriteQueues()
     }
 }
 
+//
+// ── DrainIoCallbacks ──────────────────────────────────────────────────────────
+//
+// Swaps m_io_callbacks out under the lock, then invokes the callbacks outside
+// the lock.  The swap-then-release pattern prevents deadlock if a callback
+// itself calls PostToIoThread (which acquires m_io_callbacks_mutex).
+//
+
 void SshTransport::DrainIoCallbacks()
 {
     std::vector<std::function<void()>> callbacks;
@@ -384,6 +480,14 @@ void SshTransport::DrainIoCallbacks()
     }
     for (auto& fn : callbacks) fn();
 }
+
+//
+// ── PumpSessions ──────────────────────────────────────────────────────────────
+//
+// Calls each registered SessionPumpFn (i.e. Socks5Session::PumpSshRead) once
+// per I/O loop iteration.  Pumps that return false — session closed — are
+// erased in-place via the erase-remove idiom.
+//
 
 void SshTransport::PumpSessions()
 {

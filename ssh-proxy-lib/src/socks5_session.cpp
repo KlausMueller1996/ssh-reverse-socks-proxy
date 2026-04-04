@@ -1,3 +1,32 @@
+//////////////////////////////////////////////////////////////////////////////
+//
+// Socks5Session — per-channel SOCKS5 state machine
+//
+// PURPOSE
+//   Manages the full SOCKS5 lifecycle for one inbound forwarded-tcpip channel:
+//   method negotiation → CONNECT request → async TCP connect → relay.
+//
+// TWO CONCURRENT DATA FLOWS
+//   SSH → TCP  PumpSshRead() is called by the SSH I/O thread every loop
+//              iteration.  During negotiation states it feeds the state
+//              machine; in Relaying state it forwards bytes directly to m_tcp.
+//
+//   TCP → SSH  StartRelay() arms a TcpConnection read callback on an IOCP
+//              worker thread.  That callback calls m_channel->Write(), which
+//              (off the I/O thread) posts to the per-channel write queue and
+//              returns without blocking.
+//
+// OWNERSHIP AND CYCLE PREVENTION
+//   Socks5Session owns m_tcp (shared_ptr<TcpConnection>).  All m_tcp
+//   callbacks capture weak_ptr<Socks5Session> to prevent the cycle
+//   session→m_tcp→callback→session that would block destruction.
+//
+// THREAD SAFETY OF Close()
+//   m_state.exchange(State::Closed) ensures Close() executes exactly once
+//   regardless of which thread — IOCP or SSH I/O — arrives first.
+//
+//////////////////////////////////////////////////////////////////////////////
+
 #include "socks5_session.h"
 #include "logger.h"
 
@@ -11,10 +40,27 @@ Socks5Session::~Socks5Session()
     Close();
 }
 
+//
+// ── Start ─────────────────────────────────────────────────────────────────────
+//
+// Intentionally empty.  The full lifecycle — method negotiation, CONNECT
+// request, TCP connect, relay — is driven entirely by PumpSshRead() on the
+// SSH I/O thread.  Start() exists so callers have a uniform activation point
+// if startup work is ever needed.
+//
+
 void Socks5Session::Start()
 {
     // Full lifecycle (handshake + relay) is driven non-blocking by PumpSshRead().
 }
+
+//
+// ── OnChannelData ─────────────────────────────────────────────────────────────
+//
+// Appends newly arrived channel bytes to m_inbound_buf then dispatches to the
+// state handler.  Called only in ReadingMethods and ReadingRequest states;
+// PumpSshRead forwards directly to m_tcp in Relaying state (bypasses this).
+//
 
 void Socks5Session::OnChannelData(const uint8_t* data, size_t len)
 {
@@ -31,6 +77,15 @@ void Socks5Session::OnChannelData(const uint8_t* data, size_t len)
         break;
     }
 }
+
+//
+// ── HandleMethodNegotiation ───────────────────────────────────────────────────
+//
+// Completes the method-selection exchange.  Rejects the connection if the
+// client did not offer AUTH_NONE — we support no-auth only.  On acceptance,
+// advances state to ReadingRequest and immediately processes any leftover
+// bytes already in m_inbound_buf (client may pipeline the CONNECT request).
+//
 
 void Socks5Session::HandleMethodNegotiation(const uint8_t* data, size_t len)
 {
@@ -58,6 +113,14 @@ void Socks5Session::HandleMethodNegotiation(const uint8_t* data, size_t len)
     if (!m_inbound_buf.empty())
         HandleConnectRequest(m_inbound_buf.data(), m_inbound_buf.size());
 }
+
+//
+// ── HandleConnectRequest ──────────────────────────────────────────────────────
+//
+// Parses the CONNECT request and launches the async TCP connect.  An unknown
+// address type is caught by ParseConnectRequest (returns -1); an unrecognised
+// command would still return the byte count so we can reply before closing.
+//
 
 void Socks5Session::HandleConnectRequest(const uint8_t* data, size_t len)
 {

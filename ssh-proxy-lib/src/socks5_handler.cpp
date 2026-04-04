@@ -1,7 +1,35 @@
+//////////////////////////////////////////////////////////////////////////////
+//
+// Socks5 — stateless SOCKS5 protocol codec (RFC 1928)
+//
+// PURPOSE
+//   Pure functions that parse inbound SOCKS5 wire messages and build outbound
+//   replies.  No state is held; all functions are safe for concurrent use.
+//
+// PARSE RETURN CONVENTION
+//   > 0  bytes consumed — message is complete and valid
+//     0  incomplete — caller should buffer more data and retry
+//    -1  protocol error — caller should send an error reply and close
+//
+// UNSUPPORTED COMMANDS
+//   Only CMD_CONNECT is supported.  ParseConnectRequest returns the full byte
+//   count even for CMD_BIND / CMD_UDP_ASSOCIATE so the caller can send a
+//   well-formed REP_COMMAND_NOT_SUPPORTED reply without re-parsing the packet.
+//
+//////////////////////////////////////////////////////////////////////////////
+
 #include "socks5_handler.h"
 #include <cstring>
 
 namespace Socks5 {
+
+//
+// ── ParseMethodRequest ────────────────────────────────────────────────────────
+//
+// Parses the client's method-selection message (RFC 1928 §3).  Sets
+// supports_no_auth if AUTH_NONE (0x00) appears in the method list.
+// Returns bytes consumed, 0 if incomplete, or -1 on version mismatch.
+//
 
 int ParseMethodRequest(const uint8_t* data, size_t len, bool& supports_no_auth)
 {
@@ -30,6 +58,16 @@ ByteBuffer BuildMethodResponse(uint8_t method)
 {
     return { VERSION, method };
 }
+
+//
+// ── ParseConnectRequest ───────────────────────────────────────────────────────
+//
+// Parses the CONNECT request (RFC 1928 §4).  The address field is variable
+// length: 4 bytes (IPv4), 1+N bytes (domain — length-prefixed), or 16 bytes
+// (IPv6).  Port follows as 2 big-endian bytes.  Address and port are written
+// to out; host is decoded to a dotted/colon-hex string for use in DNS or
+// direct connect calls.
+//
 
 int ParseConnectRequest(const uint8_t* data, size_t len, ConnectRequest& out)
 {
@@ -102,6 +140,15 @@ int ParseConnectRequest(const uint8_t* data, size_t len, ConnectRequest& out)
 
     return static_cast<int>(total);
 }
+
+//
+// ── BuildConnectReply ─────────────────────────────────────────────────────────
+//
+// Builds the server reply (RFC 1928 §6).  bind_addr and bind_port reflect the
+// server-side bound address of the connection; passing nullptr for bind_addr
+// emits four (or sixteen) zero bytes, which is correct when the server address
+// is not known or not relevant to the client.
+//
 
 ByteBuffer BuildConnectReply(uint8_t reply_code, uint8_t atyp,
                              const uint8_t* bind_addr, uint16_t bind_port)

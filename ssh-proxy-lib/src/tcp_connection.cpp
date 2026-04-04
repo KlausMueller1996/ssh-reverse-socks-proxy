@@ -1,3 +1,35 @@
+//////////////////////////////////////////////////////////////////////////////
+//
+// TcpConnection — async TCP connection to SOCKS5 target hosts (IOCP)
+//
+// PURPOSE
+//   Handles the outbound TCP leg of each SOCKS5 relay: asynchronous DNS,
+//   ConnectEx, a continuous overlapped recv loop, and a serialised send queue —
+//   all driven by the process-wide IOCP via IoEngine.
+//
+// CONNECTEX REQUIREMENTS
+//   ConnectEx requires the socket to be bound before the call (bound to
+//   INADDR_ANY:0 here).  After the completion fires, SO_UPDATE_CONNECT_CONTEXT
+//   must be set on the socket before normal socket operations can be used.
+//
+// DNS OFFLOAD
+//   getaddrinfo is blocking.  ConnectAsync posts a work item via
+//   IoEngine::PostCompletion so DNS runs on an IOCP worker thread rather than
+//   the SSH I/O thread.  m_abort is checked before and after getaddrinfo to
+//   handle Close() being called while DNS was in flight.
+//
+// SEND SERIALISATION
+//   Only one WSASend is outstanding at a time.  Send() enqueues data and
+//   starts FlushSendQueue() if no send is in progress; OnSendComplete() calls
+//   it again to drain the next entry.  Both call sites hold m_send_mutex.
+//
+// CLOSE SEQUENCE
+//   CancelIoEx cancels all pending overlapped operations; each completion
+//   arrives with ERROR_OPERATION_ABORTED (mapped to ErrorCode::Shutdown).
+//   shutdown(SD_BOTH) + closesocket follow to release the socket handle.
+//
+//////////////////////////////////////////////////////////////////////////////
+
 #include "tcp_connection.h"
 #include "logger.h"
 #include <cstring>
@@ -11,6 +43,14 @@ TcpConnection::~TcpConnection()
 {
     Close();
 }
+
+//
+// ── ConnectAsync ──────────────────────────────────────────────────────────────
+//
+// Initiates an async connect.  DNS resolution is blocking, so this posts a
+// work item to an IOCP worker thread (DoConnectOnWorkerThread) rather than
+// resolving inline, which would block the SSH I/O thread.
+//
 
 void TcpConnection::ConnectAsync(const std::string& host, uint16_t port,
                                   OnConnected on_connected)
@@ -28,6 +68,21 @@ void TcpConnection::ConnectAsync(const std::string& host, uint16_t port,
     };
     IoEngine::PostCompletion(&m_dns_ctx);
 }
+
+//////////////////////////////////////////////////////////////////////////////
+//
+// DoConnectOnWorkerThread
+//
+// Runs on an IOCP worker thread.  Performs the blocking DNS resolve, creates
+// and binds the socket (ConnectEx requires a pre-bound socket), associates it
+// with the IOCP, then fires ConnectEx to initiate the async connect.
+//
+// m_abort is checked after getaddrinfo: if Close() was called while DNS was
+// in flight the result is discarded and the on_connected callback gets
+// ErrorCode::Shutdown instead of proceeding with a socket that will be
+// immediately closed.
+//
+//////////////////////////////////////////////////////////////////////////////
 
 void TcpConnection::DoConnectOnWorkerThread(std::string host, uint16_t port)
 {
@@ -151,6 +206,14 @@ void TcpConnection::StartReading(OnDataReceived on_data, OnDisconnected on_disco
     PostRecv();
 }
 
+//
+// ── PostRecv ──────────────────────────────────────────────────────────────────
+//
+// Issues one overlapped WSARecv into m_recv_ctx.inline_buf.  The completion
+// callback (OnRecvComplete) delivers the data then re-issues PostRecv to keep
+// the recv loop running for the lifetime of the connection.
+//
+
 void TcpConnection::PostRecv()
 {
     if (!m_connected.load() || !m_reading.load()) return;
@@ -181,6 +244,14 @@ void TcpConnection::PostRecv()
     }
 }
 
+//
+// ── OnRecvComplete ────────────────────────────────────────────────────────────
+//
+// IOCP completion for WSARecv.  Zero bytes with Success signals a graceful
+// TCP close; the on_disconnect callback receives ConnectionReset to let the
+// session close both sides cleanly.
+//
+
 void TcpConnection::OnRecvComplete(IoContext* /*ctx*/, DWORD bytes, ErrorCode ec)
 {
     if (ec != ErrorCode::Success || bytes == 0)
@@ -201,6 +272,14 @@ void TcpConnection::OnRecvComplete(IoContext* /*ctx*/, DWORD bytes, ErrorCode ec
         PostRecv();
     }
 }
+
+//
+// ── Send ──────────────────────────────────────────────────────────────────────
+//
+// Thread-safe enqueue.  Copies data into the send queue and starts
+// FlushSendQueue() if no WSASend is currently outstanding.  Called from
+// IOCP worker threads (TCP→SSH relay callback) and the SSH I/O thread.
+//
 
 ErrorCode TcpConnection::Send(const uint8_t* data, size_t len)
 {
@@ -261,6 +340,14 @@ void TcpConnection::OnSendComplete(IoContext* /*ctx*/, DWORD /*bytes*/, ErrorCod
     }
     FlushSendQueue();  // called with lock held
 }
+
+//
+// ── Close ─────────────────────────────────────────────────────────────────────
+//
+// Sets the abort/connected/reading flags first so any in-flight callbacks see
+// a closed state before CancelIoEx fires their completions.  The send queue
+// is drained under m_send_mutex to release any pending ByteBuffer memory.
+//
 
 void TcpConnection::Close()
 {
